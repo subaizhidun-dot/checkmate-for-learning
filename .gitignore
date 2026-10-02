@@ -1,0 +1,40 @@
+# Local Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local editor settings, saves, logs, and generated previews
+.idea/
+.vscode/
+saves/
+output/
+*.log
+*.tmp
+checkmate.exe
+
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+.codex/
+.agents/
+.aws/
+
+# Track only images currently loaded by the game
+pic/*
+!pic/board.png
+!pic/white_chess.png
+!pic/black_chess.png
+!pic/squ.png
+!pic/pine.png
+!pic/lion.png
+!pic/elephant.png
+!pic/time_token_light.png
+!pic/time_token_dark.png
+!pic/g1_0.png
+!pic/g1_1.png
+!pic/g1_2.png
+!pic/g1_3.png
+!pic/g1_4.png
