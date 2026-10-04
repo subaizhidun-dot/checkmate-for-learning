@@ -4,13 +4,15 @@ from typing import Any
 
 
 # Startup menu.
-STARTUP_DIALOG = "Choose Start > Start G1 or Load a saved game."
+STARTUP_DIALOG = "Choose Start > Start G1 / Start G2 / Start G3 or Load a saved game."
 
 # Top menu.
 START_MENU_DIALOG = "Start menu."
 SAVE_MENU_DIALOG = "Save menu."
 LOAD_MENU_DIALOG = "Load menu."
 G1_STARTED_DIALOG = "Game 1 started. Choose the time token owner."
+G2_STARTED_DIALOG = "Game 2 started. Choose the time token owner."
+G2_CONTINUATION_DIALOG = "Game 2 continues without the time token. Black starts."
 
 # Clicks that cannot be handled in the current state.
 NO_BUTTON_DIALOG = "No button at this position."
@@ -54,7 +56,8 @@ ELEPHANT_BONUS_SKIPPED_DIALOG = "Elephant bonus skipped."
 CHECKING_WIN_DIALOG = "Checking victory conditions..."
 GAME_OVER_DIALOG = "The game is over."
 TIME_WISH_DIALOG = "Only the time token holder may spend the token by clicking their player panel."
-TIME_WISH_RESOLVED_DIALOG = "The time token is destroyed. Please load or start another game."
+NEW_GAME_PLUS_HINT = "Save this game, then start New Game+."
+TIME_WISH_RESOLVED_DIALOG = NEW_GAME_PLUS_HINT
 CONDITION_PANEL_DIALOG = "Victory conditions are shown here."
 
 # Save and load.
@@ -140,10 +143,6 @@ def time_wish_turn(token_owner: str | None) -> str:
     return f"{owner} has 1 AP. Click your player panel to spend the time token."
 
 
-def time_wish_saved(filename: str) -> str:
-    # The post-wish continuation save starts at G1 with no time-token holder.
-    return f"The time token is destroyed. New G1 start save created: {filename}. Please load or start another game."
-
 
 def choose_cost(kind: str, selected: int, required: int) -> str:
     # Cost selection while buying a special piece.
@@ -205,6 +204,18 @@ def piece_tooltip(piece: Any, owner_label: str, can_lion_control: bool, is_new: 
             lines.append("Can be intimidated by a lion and moved for 2 AP.")
         if is_new:
             lines.append("Placed this turn. Cannot actively move this turn.")
+    elif kind == "butterfly":
+        lines.extend([
+            f"{owner_label} butterfly",
+            "Spend 1 AP: move to any of the eight adjacent empty cells.",
+            "Select, then click again: spend 1 AP to end this turn and check victory.",
+            "Start an extra turn with the remaining AP and a new starting formation.",
+            "Cannot start another extra turn during that extra turn.",
+        ])
+        if can_lion_control:
+            lines.append("Can be intimidated by a lion and moved for 2 AP.")
+        if is_new:
+            lines.append("Placed this turn. Cannot move or start an extra turn this turn.")
     elif kind == "lion":
         lines.extend([
             f"{owner_label} lion",
@@ -213,6 +224,35 @@ def piece_tooltip(piece: Any, owner_label: str, can_lion_control: bool, is_new: 
         ])
         if is_new:
             lines.append("Placed this turn. Cannot actively move this turn.")
+    elif kind == "mole":
+        lines.extend([
+            f"{owner_label} mole",
+            "Spend 1 AP: move to an orthogonally adjacent empty cell.",
+            "Spend 1 AP: plant an own tree on a red marker, from any mole position.",
+            "With an own lion too: plant an enemy tree on a red marker for 2 AP.",
+        ])
+        if can_lion_control:
+            lines.append("Can be intimidated by a lion and moved for 2 AP.")
+        if is_new:
+            lines.append("Placed this turn. Cannot actively move this turn.")
+    elif kind == "tree":
+        if piece.rooted:
+            lines.extend([
+                f"{owner_label} rooted tree",
+                "Cannot move or be removed. Counts as one piece.",
+                "Its owner can select, then click again to uproot for 1 AP. No mole needed.",
+            ])
+        else:
+            lines.extend([
+                f"{owner_label} uprooted tree",
+                "Cannot be bought, sold or removed. Counts as one piece.",
+                "Spend 1 AP: move to a diagonally adjacent empty cell.",
+                "On a red marker with an own mole: select, then click again to plant for 1 AP.",
+                "Plant an enemy tree for 2 AP with both an own mole and an own lion.",
+                "Left marker shifts the lower-left corner; right marker shifts the upper-right.",
+            ])
+            if can_lion_control:
+                lines.append("Can be intimidated by a lion and moved for 2 AP.")
     return tooltip_lines(lines)
 
 
@@ -221,18 +261,18 @@ def resource_button_tooltip(resource_id: str, context: dict[str, Any]) -> str:
     lines: list[str] = []
     if resource_id == "squirrel":
         lines.append("Spend 3 AP: choose an empty cell and place a squirrel.")
-    elif resource_id == "elephant":
-        if context.get("selected_own_elephant"):
-            lines.append("Spend 1 AP: sell this elephant and place 1 refunded squirrel.")
+    elif resource_id in {"elephant", "mole"}:
+        if context.get(f"selected_own_{resource_id}"):
+            lines.append(f"Spend 1 AP: sell this {resource_id} and place 1 refunded squirrel.")
         else:
-            lines.append("Spend 1 AP and 2 squirrels: choose an empty cell and place an elephant.")
+            lines.append(f"Spend 1 AP and 2 squirrels: choose an empty cell and place a {resource_id}.")
             if not context.get("current_player_has_token"):
                 lines.append("Requires the time token.")
-    elif resource_id == "lion":
-        if context.get("selected_own_lion"):
-            lines.append("Spend 1 AP: sell this lion and place 2 refunded squirrels.")
+    elif resource_id in {"lion", "butterfly"}:
+        if context.get(f"selected_own_{resource_id}"):
+            lines.append(f"Spend 1 AP: sell this {resource_id} and place 2 refunded squirrels.")
         else:
-            lines.append("Spend 1 AP and 4 squirrels: choose an empty cell and place a lion.")
+            lines.append(f"Spend 1 AP and 4 squirrels: choose an empty cell and place a {resource_id}.")
             if not context.get("current_player_has_token"):
                 lines.append("Requires the time token.")
     elif resource_id == "time_token":
