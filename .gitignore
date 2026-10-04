@@ -16,6 +16,7 @@ checkmate.exe
 
 # Local credentials and configuration
 .env
+/settings.json
 .env.*
 !.env.example
 .codex/
@@ -38,3 +39,7 @@ pic/*
 !pic/g1_2.png
 !pic/g1_3.png
 !pic/g1_4.png
+!pic/mole.png
+!pic/butterfly.png
+!pic/tree_rooted.png
+!pic/tree_uprooted.png

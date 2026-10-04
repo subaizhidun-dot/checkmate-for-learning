@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+import re
+import base64
+from io import BytesIO
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pygame
+from basicgame import is_player_accessible
+from game2 import SHIFTED_CORNERS
+from local_settings import default_profile
+from settings_widgets import LineEditor, NUMERIC_SETTINGS
+from agent_prompts import SYSTEM_PROMPT
 
 
 BASE_DIR = Path(__file__).resolve().parent
 PIC_DIR = BASE_DIR / "pic"
 
 WINDOW_W = 1200
-WINDOW_H = 880
+WINDOW_H = 1000
 FPS = 60
 
 CELL = 88
@@ -26,7 +34,7 @@ VISIBLE_OFFSET_ROW = 1
 BOARD_W = CELL * VISIBLE_GRID_W
 BOARD_H = CELL * VISIBLE_GRID_H
 BOARD_X = (WINDOW_W - BOARD_W) // 2
-BOARD_Y = 184
+BOARD_Y = 248
 
 CONDITION_Y = 58
 CONDITION_GAP = 22
@@ -40,14 +48,15 @@ DROPDOWN_W = 300
 DROPDOWN_ROW_H = 34
 
 DIALOG_W = 1080
-DIALOG_H = 88
+DIALOG_H = 68
 DIALOG_X = (WINDOW_W - DIALOG_W) // 2
-DIALOG_Y = BOARD_Y + BOARD_H + 24
+DIALOG_Y = BOARD_Y + BOARD_H + CELL + 24
 
 BUTTON_W = CELL * 2
 BUTTON_H = CELL
 BUTTON_GAP = 28
-BUTTON_ROW_W = BUTTON_W * 4 + BUTTON_GAP * 3
+BUTTON_COUNT = 5
+BUTTON_ROW_W = BUTTON_W * BUTTON_COUNT + BUTTON_GAP * (BUTTON_COUNT - 1)
 BUTTON_X = (WINDOW_W - BUTTON_ROW_W) // 2
 BUTTON_Y = DIALOG_Y + DIALOG_H + 20
 
@@ -58,7 +67,7 @@ RIGHT_STATUS_RECT = pygame.Rect(WINDOW_W - 64 - CELL * 2, BOARD_Y + CELL * 3 + 2
 
 LEGAL_HINT_COLOR = (58, 220, 82)
 LEGAL_HINT_WIDTH = 5
-LEGAL_HINT_INSET = 8
+LEGAL_HINT_INSET = 3
 LEGAL_HINT_ARM = 20
 
 
@@ -66,6 +75,24 @@ LEGAL_HINT_ARM = 20
 class ClickRegion:
     name: str
     rect: pygame.Rect
+
+
+@dataclass
+class Sidebar:
+    title: str
+    subtitle: str
+    width: int
+    expanded: bool = True
+
+
+@dataclass
+class ExposurePane:
+    title: str
+    placeholder: str
+    text: str = ""
+    scroll: int = 0
+    colors: list = field(default_factory=list)
+    messages: list = field(default_factory=list)
 
 
 class CheckMateGui:
@@ -83,29 +110,770 @@ class CheckMateGui:
     def __init__(self) -> None:
         pygame.init()
         pygame.display.set_caption("CheckMate")
-        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+        self.sidebars = {
+            "left": Sidebar("Set", "Configuration", 280),
+            "right": Sidebar("LLM Play", "Exposure mode", 320),
+        }
+        self.exposure_panes = {
+            "thinking": ExposurePane("Model Thinking", "Waiting for model output."),
+            "notes": ExposurePane("Current Notes", "No condition notes yet."),
+        }
+        self.exposure_line_cache = {}
+        self.chat_layout_cache = None
+        self.agent_play_mode = False
+        self.llm_color = "white"
+        self.play_control_mode = "step"
+        self.player_types = {"black": "human", "white": "llm"}
+        self.api_profiles = {side: default_profile() for side in ("black", "white")}
+        self.connection_status = {side: "idle" for side in ("black", "white")}
+        self.profile_expanded = {"black": True, "white": True}
+        self.settings_scroll = 0
+        self.active_setting = None
+        self.setting_editor = LineEditor()
+        self.setting_dropdown = None
+        self.dropdown_index = 0
+        self.drag_setting_slider = None
+        self.settings_error = ""
+        self.system_prompt_expanded = True
+        self.system_prompt_line_cache = None
+        self.play_state = "idle"
+        self.play_message = "Ready"
+        self.play_can_start = False
+        self.play_received = False
+        self.play_paused = False
+        self.rule_image_cache = {}
+        self.drag_sidebar: str | None = None
+        self.screen = pygame.Surface((WINDOW_W, WINDOW_H))
+        self.window = pygame.display.set_mode(self.default_window_size(), pygame.RESIZABLE)
+        self.center_window()
+        self.native_window.maximize()
+        pygame.event.pump()
+        self.sync_window()
         self.clock = pygame.time.Clock()
         self.small_font = pygame.font.SysFont("consolas", 18)
+        self.dialog_font = pygame.font.SysFont("microsoftyahei,simhei", 18)
+        self.exposure_font = pygame.font.SysFont("microsoftyahei,simhei,notosanscjksc,wenquanyimicrohei", 16)
         self.menu_font = pygame.font.SysFont("consolas", 18, bold=True)
         self.button_font = pygame.font.SysFont("consolas", 20, bold=True)
         self.tooltip_font = pygame.font.SysFont("consolas", 16)
 
         self.images = self.load_images()
         self.background = self.create_wood_background()
-        self.condition_files = ["g1_0.png", "g1_1.png", "g1_2.png", "g1_3.png", "g1_4.png"]
+        self.mode = 0
+        self.new_game_plus_available = False
+        self.condition_files = []
         self.condition_images: dict[str, pygame.Surface] = {}
         self.prepare_condition_images()
 
-        self.resource_buttons = [
-            ("squirrel", "Squirrel"),
-            ("elephant", "Elephant (2)"),
-            ("lion", "Lion (4)"),
-            ("time_token", "Time Token"),
-        ]
+        self.resource_buttons = [(f"placeholder_{index}", "") for index in range(BUTTON_COUNT)]
+        self.actionable_cells = {(x, y) for y in range(1, 6) for x in range(2, 7)}
         self.open_menu: str | None = None
         self.save_slots: dict[str, Path | None] = {}
         self.click_regions: list[ClickRegion] = []
         self.build_click_regions()
+
+    @property
+    def setting_buffer(self):
+        return self.setting_editor.text
+
+    @setting_buffer.setter
+    def setting_buffer(self, value):
+        self.setting_editor.load(value)
+
+    @property
+    def setting_cursor(self):
+        return self.setting_editor.cursor
+
+    @setting_cursor.setter
+    def setting_cursor(self, value):
+        self.setting_editor.cursor = max(0, min(len(self.setting_buffer), value))
+
+    @property
+    def setting_select_all(self):
+        return self.setting_editor.selection == (0, len(self.setting_buffer)) and bool(self.setting_buffer)
+
+    @setting_select_all.setter
+    def setting_select_all(self, value):
+        if value:
+            self.setting_editor.select_all()
+        else:
+            self.setting_editor.anchor = None
+
+    def set_mode(self, game, new_game_plus_available=False) -> None:
+        self.new_game_plus_available = bool(new_game_plus_available)
+        mode = game.gamemode if game is not None else 0
+        if mode != self.mode:
+            self.mode = mode
+            self.condition_files = (
+                ["g1_0.png"] + [f"g2_distance_{limit}" for limit in range(6, 0, -1)]
+                if mode == 2 else ["g1_0.png", "g3_move", "g3_trade", "g3_start", "g3_end"]
+                if mode == 3 else [f"g1_{index}.png" for index in range(5)] if mode == 1 else []
+            )
+            self.prepare_condition_images()
+            special = ("mole", "Mole (2)") if mode == 2 else ("elephant", "Elephant (2)")
+            self.resource_buttons = (
+                [("squirrel", "Squirrel"), special, ("lion", "Lion (4)"),
+                 ("butterfly", "Butterfly (4)") if mode == 3 else ("placeholder_3", ""),
+                 ("time_token", "Time Token")]
+                if mode else [(f"placeholder_{index}", "") for index in range(BUTTON_COUNT)]
+            )
+        self.actionable_cells = {
+            (x, y) for y in range(7) for x in range(9)
+            if (is_player_accessible(game, (x, y)) if game is not None else 2 <= x <= 6 and 1 <= y <= 5)
+        }
+        self.build_click_regions()
+
+    def desktop_area(self) -> pygame.Rect:
+        if pygame.display.get_driver() == "windows":
+            import ctypes
+            from ctypes import wintypes
+            work_area = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work_area), 0):
+                return pygame.Rect(work_area.left, work_area.top,
+                                   work_area.right - work_area.left, work_area.bottom - work_area.top)
+        return pygame.Rect((0, 0), pygame.display.get_desktop_sizes()[0])
+
+    def center_window(self) -> None:
+        self.bind_native_window()
+        area = self.desktop_area()
+        window_w, window_h = self.window.get_size()
+        self.native_window.position = (area.x + (area.w - window_w) // 2,
+                                       area.y + (area.h - window_h) // 2)
+
+    def bind_native_window(self) -> None:
+        from pygame._sdl2.video import Window
+        # SDL's event system stores a borrowed pointer to this wrapper.
+        # Keep it alive for as long as the display window can receive events.
+        self.native_window = Window.from_display_module()
+
+    def default_window_size(self) -> tuple[int, int]:
+        desktop_w, desktop_h = self.desktop_area().size
+        return max(1, desktop_w - 32), max(1, desktop_h - 64)
+
+    def sync_window(self) -> None:
+        # Pygame 2 updates the display surface when the OS resizes the window.
+        self.window = pygame.display.get_surface()
+        self.update_viewport()
+
+    def update_viewport(self) -> None:
+        window_w, window_h = self.window.get_size()
+        margin = min(8, max(0, window_w // 100), max(0, window_h // 100))
+        gap = min(10, max(0, window_w // 100))
+        widths = {
+            side: min(bar.width, max(1, round(window_w * 0.28))) if bar.expanded else min(34, max(1, window_w // 12))
+            for side, bar in self.sidebars.items()
+        }
+        self.sidebar_rects = {
+            "left": pygame.Rect(margin, margin, widths["left"], max(1, window_h - margin * 2)),
+            "right": pygame.Rect(window_w - margin - widths["right"], margin, widths["right"], max(1, window_h - margin * 2)),
+        }
+        self.sidebar_toggle_rects = {}
+        self.sidebar_grip_rects = {}
+        for side, rect in self.sidebar_rects.items():
+            button_w = min(28, rect.w)
+            button_x = rect.right - button_w - 4 if self.sidebars[side].expanded else rect.centerx - button_w // 2
+            self.sidebar_toggle_rects[side] = pygame.Rect(button_x, rect.y + 6, button_w, min(28, rect.h))
+            self.sidebar_grip_rects[side] = pygame.Rect(rect.right - 4 if side == "left" else rect.left - 2,
+                                                       rect.y + 42, 6, max(1, rect.h - 42))
+        left = self.sidebar_rects["left"].right + gap
+        right = self.sidebar_rects["right"].left - gap
+        self.game_area = pygame.Rect(left, margin, max(1, right - left), max(1, window_h - margin * 2))
+        width, height = self.screen.get_size()
+        scale = min(self.game_area.w / width, self.game_area.h / height)
+        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        self.viewport = pygame.Rect(self.game_area.centerx - size[0] // 2,
+                                    self.game_area.centery - size[1] // 2, *size)
+
+    def resize_window(self, size: tuple[int, int]) -> None:
+        self.window = pygame.display.set_mode((max(1, size[0]), max(1, size[1])), pygame.RESIZABLE)
+        self.bind_native_window()
+        self.update_viewport()
+
+    def handle_sidebar_event(self, event: pygame.event.Event) -> bool:
+        if event.type == pygame.MOUSEWHEEL:
+            position = getattr(event, "pos", pygame.mouse.get_pos())
+            amount = -event.y if getattr(event, "flipped", False) else event.y
+            return self.scroll_settings(position, -amount * 54) or self.scroll_exposure_pane(position, -amount * 3)
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button in {4, 5}:
+            return self.scroll_settings(event.pos, -54 if event.button == 4 else 54) or self.scroll_exposure_pane(event.pos, -3 if event.button == 4 else 3)
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self.drag_sidebar is not None:
+            self.drag_sidebar = None
+            return True
+        if event.type == pygame.MOUSEMOTION and self.drag_sidebar is not None:
+            side = self.drag_sidebar
+            rect = self.sidebar_rects[side]
+            width = event.pos[0] - rect.left if side == "left" else rect.right - event.pos[0]
+            maximum = max(1, min(440, round(self.window.get_width() * 0.28)))
+            self.sidebars[side].width = max(min(180, maximum), min(maximum, width))
+            self.update_viewport()
+            return True
+        if event.type != pygame.MOUSEBUTTONDOWN:
+            return False
+        for side, rect in self.sidebar_rects.items():
+            if event.button == 1:
+                if self.sidebar_toggle_rects[side].collidepoint(event.pos):
+                    self.sidebars[side].expanded = not self.sidebars[side].expanded
+                    self.update_viewport()
+                    return True
+                if self.sidebars[side].expanded and self.sidebar_grip_rects[side].collidepoint(event.pos):
+                    self.drag_sidebar = side
+                    return True
+            if rect.collidepoint(event.pos):
+                return True
+        return False
+
+    def to_logical_position(self, position: tuple[int, int]) -> tuple[int, int] | None:
+        if not self.viewport.collidepoint(position):
+            return None
+        return ((position[0] - self.viewport.x) * self.screen.get_width() // self.viewport.w,
+                (position[1] - self.viewport.y) * self.screen.get_height() // self.viewport.h)
+
+    def to_window_position(self, position: tuple[int, int]) -> tuple[int, int]:
+        return (self.viewport.x + round(position[0] * self.viewport.w / self.screen.get_width()),
+                self.viewport.y + round(position[1] * self.viewport.h / self.screen.get_height()))
+
+    def present(self) -> None:
+        self.update_viewport()
+        self.window.fill((35, 28, 24))
+        self.window.blit(pygame.transform.smoothscale(self.screen, self.viewport.size), self.viewport)
+        self.draw_sidebars()
+
+    def draw_sidebars(self) -> None:
+        for side, bar in self.sidebars.items():
+            rect = self.sidebar_rects[side]
+            pygame.draw.rect(self.window, (27, 29, 32), rect, border_radius=5)
+            pygame.draw.rect(self.window, (100, 88, 70), rect, 1, border_radius=5)
+            button = self.sidebar_toggle_rects[side]
+            pygame.draw.rect(self.window, (67, 64, 57), button, border_radius=3)
+            arrow = ("<" if side == "left" else ">") if bar.expanded else (">" if side == "left" else "<")
+            label = self.menu_font.render(arrow, True, (233, 216, 181))
+            self.window.blit(label, label.get_rect(center=button.center))
+            if bar.expanded:
+                title = self.menu_font.render(bar.title, True, (234, 222, 199))
+                self.window.blit(title, (rect.x + 14, rect.y + 10))
+                subtitle = self.tooltip_font.render(bar.subtitle, True, (171, 161, 140))
+                self.window.blit(subtitle, (rect.x + 14, rect.y + 44))
+                pygame.draw.line(self.window, (71, 67, 59), (rect.x + 12, rect.y + 76), (rect.right - 12, rect.y + 76))
+                grip_x = rect.right - 2 if side == "left" else rect.left + 2
+                center_y = rect.centery
+                pygame.draw.line(self.window, (118, 106, 84), (grip_x, center_y - 20), (grip_x, center_y + 20), 2)
+                if side == "right":
+                    self.draw_exposure_panes()
+                else:
+                    self.draw_settings()
+            else:
+                label = self.tooltip_font.render("Set" if side == "left" else "LLM", True, (171, 161, 140))
+                self.window.blit(label, label.get_rect(center=(rect.centerx, rect.y + 56)))
+
+    def settings_body(self):
+        rect = self.sidebar_rects["left"]
+        reserved = 202 if self.agent_play_mode else 100
+        return pygame.Rect(rect.x + 12, rect.y + 88, max(1, rect.w - 24), max(1, rect.h - reserved))
+
+    def settings_rows(self):
+        rows = [("agent_play_mode", "Agent Play Mode", "On" if self.agent_play_mode else "Off")]
+        if not self.agent_play_mode:
+            return rows
+        rows.append(("play_control_mode", "Play Control Mode", self.play_control_mode.capitalize()))
+        labels = {"endpoint": "API Base URL", "api_key": "API Key", "model": "Model",
+                  "max_tokens": "Output Token Limit", "token_parameter": "Token Limit Parameter",
+                  "timeout": "Timeout (seconds)", "temperature": "Temperature",
+                  "reasoning_effort": "Reasoning Effort", "vision": "Image Input"}
+        for side in ("black", "white"):
+            rows.append(("player:" + side, "Black / First Player" if side == "black" else "White / Second Player",
+                         "LLM" if self.player_types[side] == "llm" else "Human"))
+            if self.player_types[side] != "llm":
+                continue
+            rows.append(("profile:" + side, "API Configuration",
+                         "Hide" if self.profile_expanded[side] else "Show"))
+            if not self.profile_expanded[side]:
+                continue
+            for key, title in labels.items():
+                value = self.api_profiles[side][key]
+                if key == "api_key":
+                    value = "*" * min(12, len(value)) if value else "Click to enter"
+                elif key == "vision":
+                    value = "On" if value else "Off"
+                elif value is None or value == "":
+                    value = "Click to enter" if key in {"endpoint", "model"} else "Default"
+                rows.append((f"field:{side}:{key}", title, str(value)))
+                if key == "model":
+                    state = self.connection_status[side]
+                    rows.append((f"test:{side}", "Model Connection", "Testing..." if state == "running" else "Test Connection"))
+        rows.append(("system_prompt", "Default System Prompt", "Hide" if self.system_prompt_expanded else "Show"))
+        if self.system_prompt_expanded:
+            rows.extend([("system_prompt_text", "", SYSTEM_PROMPT), ("copy_system_prompt", "", "Copy Text")])
+        return rows
+
+    def system_prompt_lines(self, width):
+        key = (SYSTEM_PROMPT, width)
+        if self.system_prompt_line_cache is None or self.system_prompt_line_cache[0] != key:
+            # The existing prompt contains words short enough for a minimum
+            # sidebar width; it needs wrapping without an ellipsis limit.
+            lines = self.wrap_text(SYSTEM_PROMPT, max(1, width), max_lines=1000, font=self.exposure_font)
+            self.system_prompt_line_cache = (key, lines)
+        return self.system_prompt_line_cache[1]
+
+    def setting_row_height(self, name, body):
+        if name == "system_prompt_text":
+            line_height = self.exposure_font.get_linesize() + 3
+            return len(self.system_prompt_lines(body.w - 20)) * line_height + 28
+        if name == "copy_system_prompt":
+            return 38
+        return 82 if name.startswith("field:") and name.split(":")[-1] in NUMERIC_SETTINGS else 58
+
+    def settings_layout(self):
+        body = self.settings_body()
+        rows = self.settings_rows()
+        heights = [self.setting_row_height(name, body) for name, _, _ in rows]
+        self.settings_content_height = sum(heights)
+        maximum = max(0, self.settings_content_height - body.h)
+        self.settings_scroll = max(0, min(maximum, self.settings_scroll))
+        layout = []
+        character_width = self.tooltip_font.size(" ")[0]
+        top = body.y - self.settings_scroll
+        for (name, title, value), height in zip(rows, heights):
+            indent = character_width * 2 if name.startswith(("profile:", "field:", "test:")) else 0
+            if name == "system_prompt_text":
+                layout.append((name, title, value, pygame.Rect(body.x, top, body.w, height - 8)))
+                top += height
+                continue
+            layout.append((name, title, value, pygame.Rect(
+                body.x + indent, top + (22 if title else 0), body.w - indent, 30)))
+            top += height
+        return layout
+
+    def setting_input_rect(self, name, rect):
+        if name.startswith("field:") and name.split(":")[-1] in NUMERIC_SETTINGS:
+            return pygame.Rect(rect.x, rect.y, max(24, rect.w - 76), rect.h)
+        return rect
+
+    def numeric_slider_rect(self, rect):
+        return pygame.Rect(rect.x + 4, rect.bottom + 5, max(1, rect.w - 8), 16)
+
+    def dropdown_values(self, name):
+        if name == "play_control_mode":
+            return ("step", "auto")
+        if name.startswith("player:"):
+            return ("human", "llm")
+        if name.endswith(":token_parameter"):
+            return ("max_tokens", "max_completion_tokens")
+        if name.endswith(":reasoning_effort"):
+            return ("default", "none", "low", "medium", "high")
+        return ()
+
+    def dropdown_controls(self):
+        name = self.setting_dropdown
+        if name is None or not self.agent_play_mode or not self.sidebars["left"].expanded:
+            return {}
+        layout = {key: rect for key, _, _, rect in self.settings_layout()}
+        rect = layout.get(name)
+        body = self.settings_body()
+        if rect is None or not body.contains(rect):
+            self.setting_dropdown = None
+            return {}
+        values = self.dropdown_values(name)
+        top = rect.bottom + 2
+        if top + len(values) * 28 > body.bottom:
+            top = rect.y - len(values) * 28 - 2
+        top = max(body.y, top)
+        return {value: pygame.Rect(rect.x, top + index * 28, rect.w, 28).clip(body)
+                for index, value in enumerate(values)}
+
+    def setting_controls(self):
+        bar = self.sidebar_rects["left"]
+        if not self.sidebars["left"].expanded or bar.w < 100 or bar.h < 226:
+            return {}
+        body = self.settings_body()
+        controls = {}
+        for name, _, _, rect in self.settings_layout():
+            if name == "system_prompt_text":
+                continue
+            item = self.setting_input_rect(name, rect)
+            if item.colliderect(body):
+                controls[name] = item.clip(body)
+            if name.startswith("field:") and name.split(":")[-1] in NUMERIC_SETTINGS:
+                slider = self.numeric_slider_rect(rect)
+                if slider.colliderect(body):
+                    controls["slider:" + name[6:]] = slider.clip(body)
+            if name.startswith("field:") and name.split(":")[-1] in NUMERIC_SETTINGS and rect.colliderect(body):
+                controls["default:" + name[6:]] = pygame.Rect(rect.right - 70, rect.y, 70, rect.h).clip(body)
+        if not self.agent_play_mode:
+            return controls
+        width = (bar.w - 32) // 3
+        for index, name in enumerate(("next", "pause", "stop")):
+            controls[name] = pygame.Rect(bar.x + 12 + index * (width + 4), bar.bottom - 54, width, 42)
+        return controls
+
+    def scroll_settings(self, position, delta):
+        rect = self.sidebar_rects["left"]
+        if not rect.collidepoint(position):
+            return False
+        if self.sidebars["left"].expanded and self.settings_body().collidepoint(position):
+            self.setting_dropdown = None
+            self.settings_scroll += delta
+            self.settings_layout()
+        return True
+
+    def fit_setting_text(self, text, width):
+        while text and self.tooltip_font.size(text)[0] > width:
+            text = text[:-1]
+        return text
+
+    def play_control_visuals(self, now=None):
+        now = pygame.time.get_ticks() if now is None else now
+        green, yellow, red, gray = (62, 218, 105), (242, 193, 66), (235, 74, 72), (139, 142, 145)
+        blinking = self.play_state == "ready" and self.play_received
+        return {
+            "next": {"color": green if self.play_state == "running" or blinking else gray,
+                     "visible": not blinking or now % 900 < 550, "icon": "play"},
+            "pause": {"color": yellow if self.play_state == "pausing" else gray,
+                      "visible": True, "icon": "pause"},
+            "stop": {"color": red if self.play_state == "stopped" else gray, "visible": True, "icon": "stop"},
+        }
+
+    def draw_settings(self):
+        controls = self.setting_controls()
+        if not controls:
+            return
+        body = self.settings_body()
+        original_clip = self.window.get_clip()
+        self.window.set_clip(body)
+        for name, title, value, rect in self.settings_layout():
+            if not pygame.Rect(rect.x, rect.y - (22 if title else 0), rect.w,
+                               rect.h + (22 if title else 0) + 24).colliderect(body):
+                continue
+            if name == "system_prompt_text":
+                self.draw_system_prompt_preview(rect)
+                continue
+            if name.startswith(("profile:", "field:", "test:")):
+                stem = body.x + self.tooltip_font.size(" ")[0] // 2
+                pygame.draw.line(self.window, (171, 161, 140), (stem, rect.y - 20), (stem, rect.centery), 1)
+                pygame.draw.line(self.window, (171, 161, 140), (stem, rect.centery), (rect.x - 4, rect.centery), 1)
+                pygame.draw.polygon(self.window, (171, 161, 140), [
+                    (rect.x - 3, rect.centery), (rect.x - 8, rect.centery - 3), (rect.x - 8, rect.centery + 3)])
+            self.window.blit(self.tooltip_font.render(self.fit_setting_text(title, rect.w), True, (210, 203, 186)), (rect.x, rect.y - 22))
+            full_rect = rect
+            rect = self.setting_input_rect(name, rect)
+            pygame.draw.rect(self.window, (58, 61, 65), rect, border_radius=3)
+            if name == self.active_setting:
+                self.draw_setting_editor(name, rect)
+                pygame.draw.rect(self.window, (213, 184, 99), rect, 1, border_radius=3)
+            else:
+                reserved = 28 if self.dropdown_values(name) or name.startswith("test:") else 12
+                value = self.fit_setting_text(value, rect.w - reserved)
+                label = self.tooltip_font.render(value, True, (234, 222, 199))
+                center = ((rect.centerx + 8, rect.centery) if name.startswith("test:") else
+                          (rect.centerx - 6, rect.centery) if self.dropdown_values(name) else rect.center)
+                self.window.blit(label, label.get_rect(center=center))
+            if self.dropdown_values(name):
+                pygame.draw.polygon(self.window, (234, 222, 199), [
+                    (rect.right - 13, rect.centery - 2), (rect.right - 5, rect.centery - 2), (rect.right - 9, rect.centery + 3)])
+            if name.startswith("test:"):
+                status = self.connection_status[name.split(":")[1]]
+                color = {"success": (62, 218, 105), "failed": (235, 74, 72),
+                         "running": (242, 193, 66), "idle": (139, 142, 145)}[status]
+                pygame.draw.circle(self.window, color, (rect.x + 12, rect.centery), 5)
+            if name.startswith("field:") and name.split(":")[-1] in NUMERIC_SETTINGS:
+                _, side, key = name.split(":")
+                low, high, _ = NUMERIC_SETTINGS[key]
+                number = self.api_profiles[side][key]
+                slider = self.numeric_slider_rect(full_rect)
+                enabled = number is not None
+                fraction = max(0, min(1, (number - low) / (high - low))) if enabled else 0
+                pygame.draw.line(self.window, (95, 96, 99), (slider.left, slider.centery), (slider.right - 1, slider.centery), 3)
+                pygame.draw.circle(self.window, (213, 184, 99) if enabled else (115, 116, 119),
+                                   (slider.left + round(fraction * (slider.w - 1)), slider.centery), 5)
+            if name.startswith("field:") and name.split(":")[-1] in NUMERIC_SETTINGS:
+                button = pygame.Rect(full_rect.right - 70, full_rect.y, 70, full_rect.h)
+                pygame.draw.rect(self.window, (58, 61, 65), button, border_radius=3)
+                label = self.tooltip_font.render("Default", True, (234, 222, 199))
+                self.window.blit(label, label.get_rect(center=button.center))
+        self.draw_setting_dropdown()
+        self.window.set_clip(original_clip)
+        if not self.agent_play_mode:
+            return
+        if self.settings_content_height > body.h:
+            height = max(18, int(body.h * body.h / self.settings_content_height))
+            maximum = self.settings_content_height - body.h
+            y = body.y + int((body.h - height) * self.settings_scroll / maximum)
+            pygame.draw.rect(self.window, (118, 106, 84), (body.right + 3, y, 3, height))
+        bar = self.sidebar_rects["left"]
+        pygame.draw.line(self.window, (71, 67, 59), (body.x, bar.bottom - 106), (body.right, bar.bottom - 106))
+        message = self.settings_error or self.play_message
+        self.window.blit(self.tooltip_font.render(self.fit_setting_text(message, body.w), True, (210, 203, 186)), (body.x, bar.bottom - 94))
+        if not self.play_can_start and self.play_state in {"idle", "ready", "stopped"}:
+            hint = "Place time token first" if self.mode and self.play_message == "Initial token: human only" else "Waiting for an LLM turn"
+            self.window.blit(self.tooltip_font.render(self.fit_setting_text(hint, body.w), True, (171, 161, 140)), (body.x, bar.bottom - 74))
+        for name, visual in self.play_control_visuals().items():
+            rect = controls[name]
+            pygame.draw.rect(self.window, (58, 61, 65), rect, border_radius=3)
+            if name == "next" and not self.play_can_start and self.play_state != "running":
+                color = (97, 99, 102)
+            else:
+                color = visual["color"]
+            x, y = rect.centerx, rect.y + 11
+            if visual["visible"]:
+                if visual["icon"] == "play":
+                    pygame.draw.polygon(self.window, color, [(x - 5, y - 6), (x - 5, y + 6), (x + 6, y)])
+                elif visual["icon"] == "pause":
+                    pygame.draw.rect(self.window, color, (x - 6, y - 6, 4, 12))
+                    pygame.draw.rect(self.window, color, (x + 2, y - 6, 4, 12))
+                else:
+                    pygame.draw.rect(self.window, color, (x - 5, y - 5, 10, 10))
+            label = self.tooltip_font.render(name.capitalize(), True, (234, 222, 199))
+            self.window.blit(label, label.get_rect(center=(x, rect.bottom - 11)))
+
+    def draw_system_prompt_preview(self, rect):
+        pygame.draw.rect(self.window, (21, 23, 26), rect, border_radius=4)
+        pygame.draw.rect(self.window, (71, 67, 59), rect, 1, border_radius=4)
+        line_height = self.exposure_font.get_linesize() + 3
+        lines = self.system_prompt_lines(rect.w - 20)
+        original_clip = self.window.get_clip()
+        self.window.set_clip(rect.inflate(-12, -12).clip(original_clip))
+        first = max(0, (original_clip.top - rect.y - 10) // line_height)
+        last = min(len(lines), (original_clip.bottom - rect.y - 10) // line_height + 1)
+        for index in range(first, last):
+            label = self.exposure_font.render(lines[index], True, (224, 225, 229))
+            self.window.blit(label, (rect.x + 10, rect.y + 10 + index * line_height))
+        self.window.set_clip(original_clip)
+
+    def setting_editor_geometry(self, rect):
+        editor, font = self.setting_editor, self.exposure_font
+        value = "*" * len(editor.text) if self.active_setting.endswith(":api_key") else editor.text
+        caret = font.size(value[:editor.cursor])[0]
+        visible = max(1, rect.w - 12)
+        if caret < editor.offset:
+            editor.offset = caret
+        elif caret > editor.offset + visible - 2:
+            editor.offset = caret - visible + 2
+        editor.offset = max(0, min(editor.offset, max(0, font.size(value)[0] - visible + 2)))
+        return value, rect.x + 6 - editor.offset, caret
+
+    def setting_cursor_at(self, rect, x):
+        value, origin, _ = self.setting_editor_geometry(rect)
+        position = x - origin
+        widths = [self.exposure_font.size(value[:index])[0] for index in range(len(value) + 1)]
+        return min(range(len(widths)), key=lambda index: abs(widths[index] - position))
+
+    def draw_setting_editor(self, name, rect):
+        value, origin, caret = self.setting_editor_geometry(rect)
+        clip = self.window.get_clip()
+        self.window.set_clip(rect.inflate(-8, -2).clip(clip))
+        start, end = self.setting_editor.selection
+        y = rect.centery - self.exposure_font.get_height() // 2
+        if start != end:
+            left = origin + self.exposure_font.size(value[:start])[0]
+            width = self.exposure_font.size(value[:end])[0] - self.exposure_font.size(value[:start])[0]
+            pygame.draw.rect(self.window, (72, 99, 131), (left, y, width, self.exposure_font.get_height()))
+        self.window.blit(self.exposure_font.render(value, True, (234, 222, 199)), (origin, y))
+        pygame.draw.line(self.window, (234, 222, 199), (origin + caret, rect.y + 5), (origin + caret, rect.bottom - 5))
+        self.window.set_clip(clip)
+
+    def draw_setting_dropdown(self):
+        for index, (value, rect) in enumerate(self.dropdown_controls().items()):
+            pygame.draw.rect(self.window, (72, 79, 89) if index == self.dropdown_index else (40, 43, 48), rect)
+            pygame.draw.rect(self.window, (116, 108, 92), rect, 1)
+            text = "LLM" if value == "llm" else value.capitalize() if self.setting_dropdown.startswith(("player:", "play_control")) else value
+            self.window.blit(self.tooltip_font.render(self.fit_setting_text(text, rect.w - 12), True, (234, 222, 199)), (rect.x + 6, rect.y + 5))
+
+    def rule_image_payloads(self):
+        """Current displayed clue images as cached PNGs, with ordinal IDs only."""
+        if self.mode not in self.rule_image_cache:
+            cards = []
+            for index, name in enumerate(self.condition_files, 1):
+                buffer = BytesIO()
+                pygame.image.save(self.condition_images[name], buffer, "clue.png")
+                cards.append({"index": index, "mime_type": "image/png",
+                              "data": base64.b64encode(buffer.getvalue()).decode("ascii")})
+            self.rule_image_cache[self.mode] = cards
+        return self.rule_image_cache[self.mode]
+
+    def exposure_pane_rects(self):
+        rect = self.sidebar_rects["right"]
+        if not self.sidebars["right"].expanded or rect.w < 48 or rect.h < 220:
+            return {}
+        available = pygame.Rect(rect.x + 12, rect.y + 88, rect.w - 24, rect.h - 100)
+        upper_height = round((available.h - 10) * 0.58)
+        return {
+            "thinking": pygame.Rect(available.x, available.y, available.w, upper_height),
+            "notes": pygame.Rect(available.x, available.y + upper_height + 10,
+                                 available.w, available.h - upper_height - 10),
+        }
+
+    def set_exposure_content(self, thinking=None, notes=None):
+        """Replace either pane's current text, keeping the other pane intact."""
+        for name, value in (("thinking", thinking), ("notes", notes)):
+            if value is not None:
+                self.exposure_panes[name].text = str(value)
+                self.exposure_panes[name].scroll = 0
+                self.exposure_panes[name].colors = []
+                self.exposure_panes[name].messages = ([{"text": str(value), "side": None, "color": None}]
+                                                       if name == "thinking" and value else [])
+                self.chat_layout_cache = None
+                self.exposure_line_cache.pop(name, None)
+
+    def append_exposure_output(self, text, color=None, side=None):
+        """Keep this live game's received output; follow the tail only when at it."""
+        pane = self.exposure_panes["thinking"]
+        rect = self.exposure_pane_rects().get("thinking")
+        follow_tail = rect is None
+        if rect is not None:
+            body = self.exposure_body(rect)
+            visible = max(1, body.h // (self.exposure_font.get_linesize() + 3))
+            follow_tail = pane.scroll >= max(0, self.exposure_line_count("thinking", body.w) - visible)
+        separator = "\n\n" if pane.text else ""
+        start = len(pane.text) + len(separator)
+        pane.text += separator + str(text)
+        pane.messages.append({"text": str(text), "side": side, "color": color})
+        self.chat_layout_cache = None
+        if color is not None:
+            pane.colors.append((start, len(pane.text), color))
+        self.exposure_line_cache.pop("thinking", None)
+        if follow_tail:
+            pane.scroll = (max(0, self.exposure_line_count("thinking", body.w) - visible)
+                           if rect is not None else 10 ** 12)
+
+    def exposure_lines(self, name, width):
+        pane = self.exposure_panes[name]
+        text = pane.text or pane.placeholder
+        key = (text, width, tuple(pane.colors))
+        cached = self.exposure_line_cache.get(name)
+        if cached is None or cached[0] != key:
+            lines, colors = [], []
+            offset = 0
+            def append_line(value):
+                lines.append(value)
+                colors.append(color)
+            for paragraph in text.split("\n"):
+                color = next((color for start, end, color in pane.colors if start <= offset < end), None)
+                line = ""
+                for token in re.findall(r"\s+|[A-Za-z0-9_]+|.", paragraph):
+                    if self.exposure_font.size(line + token)[0] > width and line:
+                        if token in "，。！？；：、）】》”’" and len(line) > 1 and not line[-1].isascii():
+                            append_line(line[:-1].rstrip())
+                            line = line[-1]
+                        else:
+                            append_line(line.rstrip())
+                            line = ""
+                        token = token.lstrip()
+                    if self.exposure_font.size(token)[0] > width:
+                        for char in token:
+                            if line and self.exposure_font.size(line + char)[0] > width:
+                                append_line(line)
+                                line = ""
+                            line += char
+                    else:
+                        line += token
+                append_line(line.rstrip())
+                offset += len(paragraph) + 1
+            cached = (key, lines, colors)
+            self.exposure_line_cache[name] = cached
+        return cached[1]
+
+    def exposure_body(self, rect):
+        return pygame.Rect(rect.x + 10, rect.y + 34, max(1, rect.w - 26), max(1, rect.h - 44))
+
+    def chat_layout(self, width):
+        messages = self.exposure_panes["thinking"].messages
+        key = (width, tuple((entry["text"], entry["side"], entry["color"]) for entry in messages))
+        if self.chat_layout_cache and self.chat_layout_cache[0] == key:
+            return self.chat_layout_cache[1:]
+        line_height = self.exposure_font.get_linesize() + 3
+        top, layout = 0, []
+        for entry in messages:
+            side = entry["side"]
+            inset = min(24, max(8, width // 10)) if side in {"black", "white"} else 0
+            padding = 8 if inset else 0
+            item_width = max(1, width - inset)
+            wrap_width = max(1, item_width - padding * 2)
+            lines = []
+            for paragraph in entry["text"].split("\n"):
+                line = ""
+                for token in re.findall(r"\s+|[A-Za-z0-9_]+|.", paragraph):
+                    if line and self.exposure_font.size(line + token)[0] > wrap_width:
+                        lines.append(line.rstrip())
+                        line, token = "", token.lstrip()
+                    for char in token:
+                        if line and self.exposure_font.size(line + char)[0] > wrap_width:
+                            lines.append(line)
+                            line = ""
+                        line += char
+                lines.append(line.rstrip())
+            height = len(lines) * line_height + padding * 2
+            layout.append({**entry, "rect": pygame.Rect(inset if side == "white" else 0, top, item_width, height),
+                           "lines": lines, "padding": padding})
+            top += height + 10
+        count = (max(0, top - 10) + line_height - 1) // line_height
+        self.chat_layout_cache = (key, layout, count)
+        return layout, count
+
+    def exposure_line_count(self, name, width):
+        if name == "thinking" and self.exposure_panes[name].messages:
+            return self.chat_layout(width)[1]
+        return len(self.exposure_lines(name, width))
+
+    def draw_chat_messages(self, body, pane):
+        line_height = self.exposure_font.get_linesize() + 3
+        for entry in self.chat_layout(body.w)[0]:
+            rect = entry["rect"].move(body.x, body.y - pane.scroll * line_height)
+            if not rect.colliderect(body):
+                continue
+            side = entry["side"]
+            if side in {"black", "white"}:
+                background = (245, 245, 242) if side == "black" else (5, 5, 7)
+                foreground = (20, 20, 22) if side == "black" else (245, 245, 245)
+                pygame.draw.rect(self.window, background, rect, border_radius=8)
+            else:
+                foreground = entry["color"] or (224, 225, 229)
+            padding = entry["padding"]
+            first = max(0, (body.top - rect.y - padding) // line_height)
+            last = min(len(entry["lines"]), (body.bottom - rect.y - padding) // line_height + 1)
+            for index in range(first, last):
+                label = self.exposure_font.render(entry["lines"][index], True, foreground)
+                self.window.blit(label, (rect.x + padding, rect.y + padding + index * line_height))
+
+    def scroll_exposure_pane(self, position, delta):
+        for name, rect in self.exposure_pane_rects().items():
+            if rect.collidepoint(position):
+                body = self.exposure_body(rect)
+                count = self.exposure_line_count(name, body.w)
+                visible = max(1, body.h // (self.exposure_font.get_linesize() + 3))
+                pane = self.exposure_panes[name]
+                pane.scroll = max(0, min(max(0, count - visible), pane.scroll + delta))
+                return True
+        return self.sidebar_rects["right"].collidepoint(position)
+
+    def draw_exposure_panes(self):
+        line_height = self.exposure_font.get_linesize() + 3
+        original_clip = self.window.get_clip()
+        for name, rect in self.exposure_pane_rects().items():
+            pane = self.exposure_panes[name]
+            pygame.draw.rect(self.window, (21, 23, 26), rect, border_radius=4)
+            pygame.draw.rect(self.window, (71, 67, 59), rect, 1, border_radius=4)
+            self.window.set_clip(rect.clip(original_clip))
+            title = self.small_font.render(pane.title, True, (225, 213, 191))
+            self.window.blit(title, (rect.x + 10, rect.y + 8))
+            body = self.exposure_body(rect)
+            lines = self.exposure_lines(name, body.w)
+            count = self.exposure_line_count(name, body.w)
+            visible = max(1, body.h // line_height)
+            pane.scroll = min(pane.scroll, max(0, count - visible))
+            self.window.set_clip(body.clip(rect).clip(original_clip))
+            color = (224, 225, 229) if pane.text else (144, 145, 148)
+            if name == "thinking" and pane.messages:
+                self.draw_chat_messages(body, pane)
+            else:
+                for index, line in enumerate(lines[pane.scroll:pane.scroll + visible]):
+                    styled = self.exposure_line_cache[name][2][pane.scroll + index]
+                    label = self.exposure_font.render(line, True, styled or color)
+                    self.window.blit(label, (body.x, body.y + index * line_height))
+            self.window.set_clip(original_clip)
+            if count > visible:
+                track = pygame.Rect(rect.right - 7, body.y, 3, body.h)
+                height = min(track.h, max(12, round(track.h * visible / count)))
+                top = track.y + round((track.h - height) * pane.scroll / (count - visible))
+                pygame.draw.rect(self.window, (110, 103, 88), (track.x, top, track.w, height), border_radius=2)
 
     def load_images(self) -> dict[str, pygame.Surface]:
         def load(name: str) -> pygame.Surface:
@@ -120,6 +888,10 @@ class CheckMateGui:
             "pine.png",
             "lion.png",
             "elephant.png",
+            "mole.png",
+            "butterfly.png",
+            "tree_rooted.png",
+            "tree_uprooted.png",
             "time_token_light.png",
             "time_token_dark.png",
             "g1_1.png",
@@ -133,14 +905,52 @@ class CheckMateGui:
         images["board_cell"] = self.create_light_wood_cell()
         images["white_cell"] = pygame.transform.smoothscale(images["white_chess.png"], (CELL, CELL))
         images["black_cell"] = pygame.transform.smoothscale(images["black_chess.png"], (CELL, CELL))
+        for side in ("black", "white"):
+            images[f"{side}_diagonal_cell"] = self.create_diagonal_piece_cell(side, images[f"{side}_cell"])
+            images[f"{side}_eight_cell"] = self.create_eight_way_piece_cell(side, images[f"{side}_cell"])
         images["squirrel"] = pygame.transform.scale(images["squ.png"], (56, 56))
         images["acorn"] = pygame.transform.scale(images["pine.png"], (34, 34))
         images["lion_piece"] = pygame.transform.scale(images["lion.png"], (68, 68))
         images["elephant_piece"] = pygame.transform.scale(images["elephant.png"], (68, 68))
+        images["mole_piece"] = pygame.transform.scale(images["mole.png"], (68, 68))
+        butterfly = images["butterfly.png"]
+        butterfly = butterfly.subsurface(butterfly.get_bounding_rect()).copy()
+        images["butterfly_piece"] = pygame.transform.smoothscale(butterfly, (68, 68))
+        for state in ("rooted", "uprooted"):
+            original = images[f"tree_{state}.png"]
+            scale = 68 / max(original.get_size())
+            images[f"tree_{state}_piece"] = pygame.transform.scale(original, (round(original.get_width() * scale), round(original.get_height() * scale)))
         images["time_token_small"] = pygame.transform.scale(images["time_token_light.png"], (40, 60))
         images["time_token_light_panel"] = pygame.transform.scale(images["time_token_light.png"], (60, 90))
         images["time_token_dark_panel"] = pygame.transform.scale(images["time_token_dark.png"], (60, 90))
         return images
+
+    def create_diagonal_piece_cell(self, side: str, base: pygame.Surface) -> pygame.Surface:
+        """Draw a full square tile with arrows pointing toward its four corners."""
+        surface = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
+        background = base.get_at((CELL // 2, CELL // 2))
+        surface.fill((background.r, background.g, background.b, 255))
+        arrow_color = (255, 255, 255) if side == "black" else (29, 29, 29)
+        inset, arm = 5, 8
+        for x, y, dx, dy in (
+            (inset, inset, 1, 1),
+            (CELL - 1 - inset, inset, -1, 1),
+            (inset, CELL - 1 - inset, 1, -1),
+            (CELL - 1 - inset, CELL - 1 - inset, -1, -1),
+        ):
+            pygame.draw.polygon(surface, arrow_color, [(x, y), (x + dx * arm, y), (x, y + dy * arm)])
+        return surface
+
+    def create_eight_way_piece_cell(self, side, base):
+        surface = self.create_diagonal_piece_cell(side, base)
+        color = (255, 255, 255) if side == "black" else (29, 29, 29)
+        c, edge, arm = CELL // 2, CELL - 6, 8
+        for points in (((c, 5), (c - arm, 13), (c + arm, 13)),
+                       ((c, edge), (c - arm, edge - arm), (c + arm, edge - arm)),
+                       ((5, c), (13, c - arm), (13, c + arm)),
+                       ((edge, c), (edge - arm, c - arm), (edge - arm, c + arm))):
+            pygame.draw.polygon(surface, color, points)
+        return surface
 
     def create_light_wood_cell(self) -> pygame.Surface:
         rng = random.Random(31)
@@ -179,6 +989,19 @@ class CheckMateGui:
     def prepare_condition_images(self) -> None:
         max_size = CELL - 4
         for name in self.condition_files:
+            if name in self.condition_images:
+                continue
+            if name.startswith("g3_"):
+                self.condition_images[name] = self.create_g3_condition_card(name)
+                continue
+            if name.startswith("g2_distance_"):
+                card = pygame.Surface((CELL - 4, CELL - 4), pygame.SRCALPHA)
+                card.fill((245, 242, 228))
+                font = pygame.font.SysFont("consolas", 42, bold=True)
+                label = font.render(name.rsplit('_', 1)[1], True, (25, 25, 25))
+                card.blit(label, label.get_rect(center=card.get_rect().center))
+                self.condition_images[name] = card
+                continue
             cropped = self.crop_condition_content_square(self.images[name])
             scale = min(max_size / cropped.get_width(), max_size / cropped.get_height())
             size = (
@@ -187,25 +1010,46 @@ class CheckMateGui:
             )
             self.condition_images[name] = pygame.transform.smoothscale(cropped, size)
 
+    def create_g3_condition_card(self, name):
+        from game3 import START_PATTERN, END_PATTERN
+        card = pygame.Surface((CELL - 4, CELL - 4), pygame.SRCALPHA)
+        card.fill((245, 242, 228))
+        if name in {"g3_start", "g3_end"}:
+            label = "Start" if name == "g3_start" else "End"
+            text = self.small_font.render(label, True, (165, 48, 42))
+            card.blit(text, text.get_rect(center=(42, 12)))
+            for x, y in START_PATTERN if name == "g3_start" else END_PATTERN:
+                rect = pygame.Rect(18 + x * 16, 29 + y * 16, 16, 16)
+                pygame.draw.rect(card, (190, 15, 120), rect)
+                pygame.draw.rect(card, (250, 230, 240), rect, 1)
+        elif name == "g3_move":
+            text = self.button_font.render("1", True, (182, 42, 36))
+            card.blit(text, text.get_rect(center=(42, 17)))
+            for x in (14, 54):
+                pygame.draw.rect(card, (35, 35, 35), (x, 43, 17, 17), 2)
+            pygame.draw.line(card, (35, 35, 35), (33, 51), (50, 51), 3)
+            pygame.draw.polygon(card, (35, 35, 35), ((50, 51), (44, 46), (44, 56)))
+        else:
+            for index, key in enumerate(("squirrel", "elephant_piece", "lion_piece", "butterfly_piece")):
+                icon = pygame.transform.smoothscale(self.images[key], (28, 28))
+                card.blit(icon, (12 + index % 2 * 32, 13 + index // 2 * 32))
+            pygame.draw.line(card, (185, 45, 35), (12, 12), (72, 72), 5)
+        return card
+
     def crop_condition_content_square(self, surface: pygame.Surface) -> pygame.Surface:
         width, height = surface.get_size()
-        xs: list[int] = []
-        ys: list[int] = []
-        for y in range(height):
-            for x in range(width):
-                r, g, b, a = surface.get_at((x, y))
-                if a > 10 and (min(r, g, b) < 185 or max(r, g, b) - min(r, g, b) > 35):
-                    xs.append(x)
-                    ys.append(y)
-
-        if not xs:
+        content = pygame.mask.from_surface(surface, 10)
+        pale_background = pygame.mask.from_threshold(surface, (255, 255, 255, 255), (71, 71, 71, 255))
+        content.erase(pale_background, (0, 0))
+        regions = content.get_bounding_rects()
+        if not regions:
             return surface.copy()
-
+        bounds = regions[0].unionall(regions[1:])
         padding = 5
-        left = max(0, min(xs) - padding)
-        right = min(width, max(xs) + padding + 1)
-        top = max(0, min(ys) - padding)
-        bottom = min(height, max(ys) + padding + 1)
+        left = max(0, bounds.left - padding)
+        right = min(width, bounds.right + padding)
+        top = max(0, bounds.top - padding)
+        bottom = min(height, bounds.bottom + padding)
         side = max(right - left, bottom - top)
         center_x = (left + right) // 2
         center_y = (top + bottom) // 2
@@ -217,16 +1061,14 @@ class CheckMateGui:
         self.click_regions.clear()
         self.add_menu_click_regions()
 
-        for visible_y in range(VISIBLE_GRID_H):
-            for visible_x in range(VISIBLE_GRID_W):
-                rect = pygame.Rect(BOARD_X + visible_x * CELL, BOARD_Y + visible_y * CELL, CELL, CELL)
-                logical_x = VISIBLE_OFFSET_COL + visible_x
-                logical_y = VISIBLE_OFFSET_ROW + visible_y
-                self.click_regions.append(ClickRegion(f"board:{logical_x},{logical_y}", rect))
+        for logical_x, logical_y in sorted(self.actionable_cells) if self.mode else []:
+            rect = self.rect_for_logical_cell(logical_x, logical_y)
+            self.click_regions.append(ClickRegion(f"board:{logical_x},{logical_y}", rect))
 
         for index, (resource_id, _label) in enumerate(self.resource_buttons):
-            x = BUTTON_X + index * (BUTTON_W + BUTTON_GAP)
-            self.click_regions.append(ClickRegion(f"resource:{resource_id}", pygame.Rect(x, BUTTON_Y, BUTTON_W, BUTTON_H)))
+            if not self.mode or resource_id.startswith("placeholder_"):
+                continue
+            self.click_regions.append(ClickRegion(f"resource:{resource_id}", self.resource_button_rect(index)))
 
         for index in range(len(self.condition_files)):
             rect = self.condition_rect(index)
@@ -241,6 +1083,8 @@ class CheckMateGui:
 
         if self.open_menu == "start":
             self.click_regions.append(ClickRegion("menu:start_g1", self.dropdown_rect(0)))
+            self.click_regions.append(ClickRegion("menu:start_g2", self.dropdown_rect(1)))
+            self.click_regions.append(ClickRegion("menu:start_g3", self.dropdown_rect(2)))
         elif self.open_menu == "save":
             for index in range(3):
                 self.click_regions.append(ClickRegion(f"menu:save_slot_{index + 1}", self.dropdown_rect(index)))
@@ -290,9 +1134,11 @@ class CheckMateGui:
         legal_resource_targets = legal_resource_targets or set()
         legal_camp_targets = legal_camp_targets or set()
         self.save_slots = save_slots or {}
+        self.set_mode(self.get_value(game, "game", game), self.get_value(game, "new_game_plus_available", False))
         self.build_click_regions()
-        mouse_pos = mouse_pos or pygame.mouse.get_pos()
-        hovered = self.find_region_name(mouse_pos)
+        if mouse_pos is None:
+            mouse_pos = self.to_logical_position(pygame.mouse.get_pos())
+        hovered = self.find_region_name(mouse_pos) if mouse_pos is not None else None
 
         self.screen.blit(self.background, (0, 0))
         self.draw_conditions(game)
@@ -301,8 +1147,9 @@ class CheckMateGui:
         self.draw_dialog(self.get_dialog_text(game))
         self.draw_resource_buttons(hovered, legal_resource_targets)
         self.draw_menu_bar(hovered)
-        if tooltip_text:
+        if tooltip_text and mouse_pos is not None:
             self.draw_tooltip(tooltip_text, mouse_pos)
+        self.present()
 
     def draw_conditions(self, game: Any) -> None:
         results = getattr(game, "condition_results", None)
@@ -317,7 +1164,7 @@ class CheckMateGui:
                 pygame.draw.rect(self.screen, color, rect.inflate(10, 10), 5, border_radius=4)
 
     def draw_menu_bar(self, hovered: str | None) -> None:
-        labels = [("start", "Start"), ("save", "Save"), ("load", "Load")]
+        labels = [("start", "New Game+" if self.new_game_plus_available else "Start"), ("save", "Save"), ("load", "Load")]
         for index, (menu_id, label) in enumerate(labels):
             rect = self.menu_rect(index)
             enabled = hovered == f"menu:{menu_id}" or self.open_menu == menu_id
@@ -326,7 +1173,8 @@ class CheckMateGui:
             self.screen.blit(rendered, rendered.get_rect(center=rect.center))
 
         if self.open_menu == "start":
-            self.draw_dropdown_row(0, "Start G1", hovered == "menu:start_g1", enabled=True)
+            for index, label in enumerate(self.start_menu_labels()):
+                self.draw_dropdown_row(index, label, hovered == f"menu:start_g{index + 1}", enabled=True)
         elif self.open_menu == "save":
             for index in range(3):
                 name = f"menu:save_slot_{index + 1}"
@@ -335,6 +1183,9 @@ class CheckMateGui:
             for index, (label, path) in enumerate(self.load_menu_items()):
                 name = f"menu:load:{path.name}" if path is not None else f"menu:disabled_load_{index}"
                 self.draw_dropdown_row(index, label, hovered == name, enabled=path is not None)
+
+    def start_menu_labels(self):
+        return [f"Start G{mode}{'+' if self.new_game_plus_available else ''}" for mode in (1, 2, 3)]
 
     def draw_dropdown_row(self, index: int, label: str, hovered: bool, enabled: bool) -> None:
         rect = self.dropdown_rect(index)
@@ -442,17 +1293,30 @@ class CheckMateGui:
         pygame.draw.rect(self.screen, (28, 28, 28), outer)
         pygame.draw.rect(self.screen, (230, 230, 224), outer, 2)
 
+        model = self.get_value(game, "game", game)
         for visible_y in range(VISIBLE_GRID_H):
             for visible_x in range(VISIBLE_GRID_W):
                 rect = pygame.Rect(BOARD_X + visible_x * CELL, BOARD_Y + visible_y * CELL, CELL, CELL)
                 logical_x = VISIBLE_OFFSET_COL + visible_x
                 logical_y = VISIBLE_OFFSET_ROW + visible_y
-                self.draw_cell(rect, self.piece_at(board, (logical_x, logical_y)))
+                if (logical_x, logical_y) in self.actionable_cells:
+                    self.draw_cell(rect, self.piece_at(board, (logical_x, logical_y)))
+                else:
+                    pygame.draw.rect(self.screen, (45, 29, 27), rect)
+                    pygame.draw.line(self.screen, (128, 55, 46), rect.topleft, rect.bottomright, 3)
+                    pygame.draw.line(self.screen, (128, 55, 46), rect.topright, rect.bottomleft, 3)
 
-        for position in legal_board_targets:
-            rect = self.rect_for_logical_cell(*position)
-            if rect is not None:
-                self.draw_legal_hint_corners(rect)
+        if self.mode == 2:
+            for corner in model.expanded_corners:
+                _, position = SHIFTED_CORNERS[corner]
+                self.draw_cell(self.rect_for_logical_cell(*position), self.piece_at(board, position))
+            for position in model.tree_markers:
+                rect = self.rect_for_logical_cell(*position)
+                if rect is not None and self.piece_at(board, position) is None:
+                    inset = 7
+                    diamond = [(rect.centerx, rect.top + inset), (rect.right - inset, rect.centery),
+                               (rect.centerx, rect.bottom - inset), (rect.left + inset, rect.centery)]
+                    pygame.draw.lines(self.screen, (231, 47, 44), True, diamond, 4)
 
         if hovered and hovered.startswith("board:"):
             rect = self.rect_for_board_region(hovered)
@@ -466,6 +1330,13 @@ class CheckMateGui:
                 pygame.draw.rect(self.screen, (255, 216, 36), rect.inflate(-8, -8), 5)
                 pygame.draw.rect(self.screen, (55, 28, 0), rect.inflate(-14, -14), 2)
 
+        # Keep legality on the full board-cell border, above piece, hover and
+        # selection artwork. Shifted corner cells use the same geometry.
+        for position in legal_board_targets:
+            rect = self.rect_for_logical_cell(*position)
+            if rect is not None:
+                self.draw_legal_hint_corners(rect)
+
     def draw_outer_logical_pieces(self, board: list[list[Any]]) -> None:
         for y, row in enumerate(board):
             for x, piece in enumerate(row):
@@ -478,13 +1349,15 @@ class CheckMateGui:
     def draw_cell(self, rect: pygame.Rect, piece: Any | None) -> None:
         self.screen.blit(self.images["board_cell"], rect.topleft)
         if piece is not None:
-            self.draw_piece(rect, self.piece_owner(piece), self.piece_kind(piece))
+            self.draw_piece(rect, self.piece_owner(piece), self.piece_kind(piece), self.get_value(piece, "rooted", True))
         pygame.draw.rect(self.screen, (32, 32, 32), rect, 2)
         pygame.draw.line(self.screen, (255, 255, 255), rect.topleft, rect.topright, 1)
         pygame.draw.line(self.screen, (255, 255, 255), rect.topleft, rect.bottomleft, 1)
 
-    def draw_piece(self, rect: pygame.Rect, side: str, kind: str) -> None:
-        cell_name = "black_cell" if side == "black" else "white_cell"
+    def draw_piece(self, rect: pygame.Rect, side: str, kind: str, rooted: bool = True) -> None:
+        cell_name = f"{side}_diagonal_cell" if kind == "tree" and not rooted else f"{side}_cell"
+        if kind == "butterfly":
+            cell_name = f"{side}_eight_cell"
         self.screen.blit(self.images[cell_name], rect.topleft)
         image_key = {
             "squirrel": "squirrel",
@@ -493,6 +1366,9 @@ class CheckMateGui:
             "pinecone": "acorn",
             "lion": "lion_piece",
             "elephant": "elephant_piece",
+            "mole": "mole_piece",
+            "butterfly": "butterfly_piece",
+            "tree": "tree_rooted_piece" if rooted else "tree_uprooted_piece",
         }.get(kind)
         if image_key is not None:
             image = self.images[image_key]
@@ -503,15 +1379,24 @@ class CheckMateGui:
         pygame.draw.rect(self.screen, (10, 10, 10), rect)
         pygame.draw.rect(self.screen, (230, 230, 230), rect, 3)
         pygame.draw.rect(self.screen, (92, 92, 92), rect.inflate(-8, -8), 1)
-        for index, line in enumerate(self.wrap_text(message, rect.width - 40, max_lines=3, font=self.small_font)):
-            label = self.small_font.render(line, True, (235, 235, 225))
+        for index, line in enumerate(self.wrap_text(message, rect.width - 40, max_lines=3, font=self.dialog_font)):
+            label = self.dialog_font.render(line, True, (235, 235, 225))
             self.screen.blit(label, (rect.x + 20, rect.y + 12 + index * 22))
+
+    def resource_button_rect(self, index):
+        x = BUTTON_X + index * (BUTTON_W + BUTTON_GAP)
+        return pygame.Rect(x, BUTTON_Y, BUTTON_W, BUTTON_H)
 
     def draw_resource_buttons(self, hovered: str | None, legal_resource_targets: set[str]) -> None:
         for index, (resource_id, label) in enumerate(self.resource_buttons):
-            x = BUTTON_X + index * (BUTTON_W + BUTTON_GAP)
-            rect = pygame.Rect(x, BUTTON_Y, BUTTON_W, BUTTON_H)
+            rect = self.resource_button_rect(index)
             self.draw_beveled_rect(rect, (214, 211, 204), enabled=hovered == f"resource:{resource_id}")
+            if resource_id.startswith("placeholder_"):
+                text = self.button_font.render("?", True, (12, 12, 12))
+                self.screen.blit(text, text.get_rect(center=rect.center))
+                continue
+            if not self.mode:
+                continue
             if resource_id == "time_token":
                 icon = self.images["time_token_small"]
                 self.screen.blit(icon, icon.get_rect(center=(rect.centerx, rect.y + 30)))
@@ -525,9 +1410,11 @@ class CheckMateGui:
 
     def draw_reserve_piece(self, center: tuple[int, int], side: str, kind: str) -> None:
         cell_name = "black_cell" if side == "black" else "white_cell"
+        if kind == "butterfly":
+            cell_name = f"{side}_eight_cell"
         cell = pygame.transform.smoothscale(self.images[cell_name], (42, 42))
         self.screen.blit(cell, cell.get_rect(center=center))
-        image_name = {"squirrel": "squ.png", "lion": "lion.png", "elephant": "elephant.png"}.get(kind)
+        image_name = {"squirrel": "squ.png", "lion": "lion.png", "elephant": "elephant.png", "mole": "mole.png", "butterfly": "butterfly_piece"}.get(kind)
         if image_name is not None:
             size = (26, 26) if kind == "squirrel" else (34, 34)
             piece = pygame.transform.scale(self.images[image_name], size)
@@ -571,19 +1458,18 @@ class CheckMateGui:
     def draw_legal_hint_corners(self, rect: pygame.Rect) -> None:
         x0 = rect.left + LEGAL_HINT_INSET
         y0 = rect.top + LEGAL_HINT_INSET
-        x1 = rect.right - LEGAL_HINT_INSET
-        y1 = rect.bottom - LEGAL_HINT_INSET
-        arm = LEGAL_HINT_ARM
+        x1 = rect.right - 1 - LEGAL_HINT_INSET
+        y1 = rect.bottom - 1 - LEGAL_HINT_INSET
+        arm = min(LEGAL_HINT_ARM, min(rect.w, rect.h) // 3)
         color = LEGAL_HINT_COLOR
         width = LEGAL_HINT_WIDTH
-        pygame.draw.line(self.screen, color, (x0, y0), (x0 + arm, y0), width)
-        pygame.draw.line(self.screen, color, (x0, y0), (x0, y0 + arm), width)
-        pygame.draw.line(self.screen, color, (x1, y0), (x1 - arm, y0), width)
-        pygame.draw.line(self.screen, color, (x1, y0), (x1, y0 + arm), width)
-        pygame.draw.line(self.screen, color, (x0, y1), (x0 + arm, y1), width)
-        pygame.draw.line(self.screen, color, (x0, y1), (x0, y1 - arm), width)
-        pygame.draw.line(self.screen, color, (x1, y1), (x1 - arm, y1), width)
-        pygame.draw.line(self.screen, color, (x1, y1), (x1, y1 - arm), width)
+        segments = [((x0, y0), (x0 + arm, y0)), ((x0, y0), (x0, y0 + arm)),
+                    ((x1, y0), (x1 - arm, y0)), ((x1, y0), (x1, y0 + arm)),
+                    ((x0, y1), (x0 + arm, y1)), ((x0, y1), (x0, y1 - arm)),
+                    ((x1, y1), (x1 - arm, y1)), ((x1, y1), (x1, y1 - arm))]
+        for stroke, size in (((17, 27, 18), width + 2), (color, width)):
+            for start, end in segments:
+                pygame.draw.line(self.screen, stroke, start, end, size)
 
     def draw_beveled_rect(self, rect: pygame.Rect, fill: tuple[int, int, int], enabled: bool) -> None:
         pygame.draw.rect(self.screen, (34, 34, 34), rect.inflate(6, 6), border_radius=3)
@@ -684,7 +1570,7 @@ class CheckMateGui:
     def rect_for_logical_cell(self, logical_x: int, logical_y: int) -> pygame.Rect | None:
         visible_x = logical_x - VISIBLE_OFFSET_COL
         visible_y = logical_y - VISIBLE_OFFSET_ROW
-        if not (0 <= visible_y < VISIBLE_GRID_H and 0 <= visible_x < VISIBLE_GRID_W):
+        if (logical_x, logical_y) not in self.actionable_cells:
             return None
         return pygame.Rect(BOARD_X + visible_x * CELL, BOARD_Y + visible_y * CELL, CELL, CELL)
 

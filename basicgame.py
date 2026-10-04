@@ -3,16 +3,19 @@ from __future__ import annotations
 
 
 Position = tuple[int, int]
+SPECIAL_KINDS = ("elephant", "lion", "mole", "butterfly")
 
 
 class Resource:
     normal_resource = ['pine']
-    piece_resource = ['squirrel','lion','elephant']
+    piece_resource = ['squirrel','lion','elephant','mole','tree','butterfly']
 
-    def __init__(self, owner, kind):
+    def __init__(self, owner, kind, rooted=True):
         self.owner = owner
         self.kind = kind
-        self.is_piece = kind in self.piece_resource             # Whether this resource can be moved by actions.
+        self.is_piece = kind in self.piece_resource             # Whether this resource counts as a piece.
+        if kind == 'tree':
+            self.rooted = rooted
 
 
 class Playerstate:
@@ -20,16 +23,19 @@ class Playerstate:
         self.color = color
         self.num_pieces = num_pieces
         self.num_squirrels = num_squirrels
-        self.has_elephant = False
-        self.has_lion = False
+        for kind in SPECIAL_KINDS:
+            setattr(self, f"has_{kind}", False)
 
     def refresh_side(self, board: Chessboard):
         """Refresh this player's piece counts and special-piece flags."""
+        self.refresh_pieces(board.board_matrix)
+
+    def refresh_pieces(self, board_matrix):
         self.num_pieces = 0
         self.num_squirrels = 0
-        self.has_elephant = False
-        self.has_lion = False
-        for row in board.board_matrix:
+        for kind in SPECIAL_KINDS:
+            setattr(self, f"has_{kind}", False)
+        for row in board_matrix:
             for cell in row:
                 if cell is None:
                     continue
@@ -39,10 +45,8 @@ class Playerstate:
                     continue
                 if cell.kind == 'squirrel':
                     self.num_squirrels += 1
-                elif cell.kind == 'lion':
-                    self.has_lion = True
-                elif cell.kind == 'elephant':
-                    self.has_elephant = True
+                elif cell.kind in SPECIAL_KINDS:
+                    setattr(self, f"has_{cell.kind}", True)
 
 
 
@@ -57,6 +61,13 @@ class Chessboard:
         self.current_ap = 1
         self.max_ap = 1
         self.new_piece = []
+        if gamemode == 2:
+            self.tree_markers = set()
+            self.skip_token_selection = False
+            self.expanded_corners = set()
+        elif gamemode == 3:
+            from game3 import G3Turn
+            self.g3_turn = G3Turn.capture(self)
 
     def spend_ap(self, cost) -> bool:
         """Spend AP if the current player has enough."""
@@ -228,7 +239,10 @@ def pos_logic_to_display(log_pos) -> (int, int):
 def is_player_accessible(board: Chessboard, log_pos: Position) -> bool:
     """Return whether a logical cell is inside the player-action area."""
     x, y = log_pos
-    if board.gamemode == 1:
+    if board.gamemode == 2:
+        from game2 import is_g2_player_access
+        return is_g2_player_access(log_pos, board)
+    if board.gamemode in {1, 3}:
         return 2 <= x <= 6 and 1 <= y <= 5
     return board.is_inside_board(log_pos)
 
@@ -264,7 +278,7 @@ def get_legal_moves_for_piece(
     own_piece = piece.owner == current_player
     lion_control = (
         not own_piece
-        and piece.kind in {"squirrel", "elephant"}
+        and piece.kind in {"squirrel", "elephant", "mole", "tree", "butterfly"}
         and playerstate.has_lion
         and board.current_ap >= 2
     )
@@ -276,15 +290,25 @@ def get_legal_moves_for_piece(
         return set()
     if not is_player_accessible(board, log_pos):
         return set()
+    if piece.kind == "tree" and piece.rooted:
+        return set()
 
     targets: set[Position] = set()
-    for target in orthogonal_neighbors(log_pos):
+    if piece.kind == "tree":
+        x, y = log_pos
+        neighbors = ((x - 1, y - 1), (x + 1, y - 1), (x - 1, y + 1), (x + 1, y + 1))
+    elif piece.kind == "butterfly":
+        x, y = log_pos
+        neighbors = tuple((x + dx, y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy)
+    else:
+        neighbors = orthogonal_neighbors(log_pos)
+    for target in neighbors:
         if not is_player_accessible(board, target):
             continue
         if piece.kind == "elephant":
             if elephant_has_open_line(board, log_pos, target):
                 targets.add(target)
-        elif piece.kind in {"squirrel", "lion"} and is_empty_accessible_cell(board, target):
+        elif piece.kind in {"squirrel", "lion", "mole", "tree", "butterfly"} and is_empty_accessible_cell(board, target):
             targets.add(target)
     return targets
 
@@ -294,7 +318,24 @@ def can_select_piece(
     players: dict[str, Playerstate],
     log_pos: Position,
 ) -> bool:
-    return bool(get_legal_moves_for_piece(board, players, log_pos))
+    from game2 import tree_action
+    from game3 import can_start_extra_turn
+    return bool(get_legal_moves_for_piece(board, players, log_pos) or tree_action(board, log_pos)
+                or can_start_extra_turn(board, log_pos))
+
+
+def can_buy_special(board, players, kind):
+    allowed = {1: {"elephant", "lion"}, 2: {"mole", "lion"},
+               3: {"elephant", "lion", "butterfly"}}
+    player = players.get(board.current_player)
+    if player is None or kind not in allowed.get(board.gamemode, set()):
+        return False
+    owned = any(piece is not None and piece.owner == board.current_player and piece.kind == kind
+                for row in board.board_matrix for piece in row)
+    cost = 2 if kind in {"elephant", "mole"} else 4
+    return (not owned and board.time_token_owner == board.current_player
+            and board.current_ap >= 1 and player.num_squirrels >= cost
+            and bool(get_empty_accessible_cells(board)))
 
 
 def can_select_resource(
@@ -306,6 +347,12 @@ def can_select_resource(
     playerstate = players.get(board.current_player)
     if playerstate is None:
         return False
+    if resource_id == 'elephant' and board.gamemode == 2:
+        return False
+    if resource_id == 'mole' and board.gamemode != 2:
+        return False
+    if resource_id == 'butterfly' and board.gamemode != 3:
+        return False
 
     empty_cells = get_empty_accessible_cells(board)
     selected_pos = interaction.selected_pos
@@ -314,31 +361,23 @@ def can_select_resource(
     if resource_id == "squirrel":
         return board.current_ap >= 3 and bool(empty_cells)
 
-    if resource_id == "elephant":
+    if resource_id in {"elephant", "mole"}:
         if (
             selected_piece is not None
             and selected_piece.owner == board.current_player
-            and selected_piece.kind == "elephant"
+            and selected_piece.kind == resource_id
         ):
             return board.current_ap >= 1
-        return (
-            board.time_token_owner == board.current_player
-            and playerstate.num_squirrels >= 2
-            and board.current_ap >= 1
-        )
+        return can_buy_special(board, players, resource_id)
 
-    if resource_id == "lion":
+    if resource_id in {"lion", "butterfly"}:
         if (
             selected_piece is not None
             and selected_piece.owner == board.current_player
-            and selected_piece.kind == "lion"
+            and selected_piece.kind == resource_id
         ):
             return board.current_ap >= 1 and len(empty_cells) >= 1
-        return (
-            board.time_token_owner == board.current_player
-            and playerstate.num_squirrels >= 4
-            and board.current_ap >= 1
-        )
+        return can_buy_special(board, players, resource_id)
 
     if resource_id == "time_token":
         return (
@@ -357,7 +396,7 @@ def get_legal_board_targets(
 ) -> set[Position]:
     if interaction.selected_pos is not None:
         return get_legal_moves_for_piece(board, players, interaction.selected_pos)
-    if interaction.selected_resource in {"squirrel", "elephant", "lion"}:
+    if interaction.selected_resource in {"squirrel", "elephant", "lion", "mole", "butterfly"}:
         return get_empty_accessible_cells(board)
 
     targets: set[Position] = set()
@@ -375,7 +414,7 @@ def get_legal_resource_targets(
 ) -> set[str]:
     return {
         resource_id
-        for resource_id in ("squirrel", "elephant", "lion", "time_token")
+        for resource_id in ("squirrel", "elephant", "mole", "lion", "butterfly", "time_token")
         if can_select_resource(board, players, interaction, resource_id)
     }
 
