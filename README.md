@@ -285,7 +285,7 @@ Guarantees worth relying on:
 
 See [GITHUB_UPLOAD.md](GITHUB_UPLOAD.md) for the current upload manifest and handoff notes.
 
-The repository contains source code, dependency information, documentation, rule checks and the 18 images currently loaded by `gui.py`. G2 number cards, G3 condition cards and full-square directional tiles are drawn at runtime. Local environments, editor settings, saved games, logs, generated previews, artwork backups, the machine-specific launcher and unused artwork are excluded through `.gitignore`.
+The repository contains source code, dependency information, documentation, rule checks and the 19 images currently loaded by `gui.py`. G2 number cards, G3 condition cards and full-square directional tiles are drawn at runtime. Local environments, editor settings, saved games, logs, generated previews, artwork backups, the machine-specific launcher and unused artwork are excluded through `.gitignore`.
 
 Mole and tree-state artwork is included for G2; a transparent golden butterfly sprite is included for G3.
 
