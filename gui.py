@@ -12,7 +12,8 @@ import pygame
 from basicgame import is_player_accessible
 from game2 import SHIFTED_CORNERS
 from local_settings import default_profile
-from settings_widgets import LineEditor, NUMERIC_SETTINGS, read_clipboard
+from settings_widgets import LineEditor, NUMERIC_SETTINGS, read_clipboard, write_clipboard
+from thinking_selection import ThinkingSelection
 from agent_prompts import SYSTEM_PROMPT, NOTES_PROMPT, NG_PLUS_PROMPT, DEFAULT_PROMPTS
 
 
@@ -121,6 +122,7 @@ class CheckMateGui:
         }
         self.exposure_line_cache = {}
         self.chat_layout_cache = None
+        self.thinking_selection = ThinkingSelection()
         self.thinking_turn = None
         self.notes_side = "black"
         self.notes_by_side = {}
@@ -164,6 +166,11 @@ class CheckMateGui:
         self.drag_sidebar: str | None = None
         self.screen = pygame.Surface((WINDOW_W, WINDOW_H))
         self.window = pygame.display.set_mode(self.default_window_size(), pygame.RESIZABLE)
+        try:
+            pygame.display.set_icon(pygame.image.load(PIC_DIR / "app_icon.png").convert_alpha())
+        except (OSError, pygame.error):
+            # A missing or damaged icon must never stop the game from starting.
+            pass
         self.center_window()
         self.native_window.maximize()
         pygame.event.pump()
@@ -172,6 +179,7 @@ class CheckMateGui:
         self.small_font = pygame.font.SysFont("consolas", 18)
         self.dialog_font = pygame.font.SysFont("microsoftyahei,simhei", 18)
         self.exposure_font = pygame.font.SysFont("microsoftyahei,simhei,notosanscjksc,wenquanyimicrohei", 16)
+        self.prompt_button_font = pygame.font.SysFont("microsoftyahei,simhei,notosanscjksc,wenquanyimicrohei", 14)
         self.menu_font = pygame.font.SysFont("consolas", 18, bold=True)
         self.button_font = pygame.font.SysFont("consolas", 20, bold=True)
         self.tooltip_font = pygame.font.SysFont("consolas", 16)
@@ -310,6 +318,8 @@ class CheckMateGui:
 
     def handle_sidebar_event(self, event: pygame.event.Event) -> bool:
         if self.handle_scrollbar_event(event) or self.handle_thinking_turn_event(event) or self.handle_notes_page_event(event):
+            return True
+        if self.handle_thinking_selection_event(event):
             return True
         if event.type == pygame.MOUSEWHEEL:
             position = getattr(event, "pos", pygame.mouse.get_pos())
@@ -493,13 +503,13 @@ class CheckMateGui:
                     rows.append((f"test:{side}", "Model Connection", "Testing..." if state == "running" else "Test Connection"))
         rows.append(("system_prompt", "Action Prompt", "Hide" if self.system_prompt_expanded else "Show"))
         if self.system_prompt_expanded:
-            rows.extend([("system_prompt_text", "", self.prompt_text("system_prompt_text")), ("copy_system_prompt", "", "Copy Text")])
+            rows.extend([("system_prompt_text", "", self.prompt_text("system_prompt_text")), ("copy_system_prompt", "", "Copy")])
         rows.append(("notes_prompt", "Notes Prompt", "Hide" if self.notes_prompt_expanded else "Show"))
         if self.notes_prompt_expanded:
-            rows.extend([("notes_prompt_text", "", self.prompt_text("notes_prompt_text")), ("copy_notes_prompt", "", "Copy Text")])
+            rows.extend([("notes_prompt_text", "", self.prompt_text("notes_prompt_text")), ("copy_notes_prompt", "", "Copy")])
         rows.append(("ng_plus_prompt", "NG+ Action Prompt", "Hide" if self.ng_plus_prompt_expanded else "Show"))
         if self.ng_plus_prompt_expanded:
-            rows.extend([("ng_plus_prompt_text", "", self.prompt_text("ng_plus_prompt_text")), ("copy_ng_plus_prompt", "", "Copy Text")])
+            rows.extend([("ng_plus_prompt_text", "", self.prompt_text("ng_plus_prompt_text")), ("copy_ng_plus_prompt", "", "Copy")])
         return rows
 
     def system_prompt_lines(self, width, prompt=SYSTEM_PROMPT):
@@ -535,6 +545,14 @@ class CheckMateGui:
             indent = character_width * 2 if name.startswith(("profile:", "field:", "test:")) else 0
             if name in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}:
                 layout.append((name, title, value, pygame.Rect(body.x, top, body.w, height - 8)))
+                top += height
+                continue
+            if name.startswith("copy_"):
+                gap = 6
+                width = max(1, (body.w - gap) // 2)
+                layout.append((name, title, value, pygame.Rect(body.x, top, width, 30)))
+                layout.append(("restore_" + name[5:], "", "Restore",
+                               pygame.Rect(body.x + width + gap, top, max(1, body.w - width - gap), 30)))
                 top += height
                 continue
             layout.append((name, title, value, pygame.Rect(
@@ -658,8 +676,13 @@ class CheckMateGui:
                 pygame.draw.rect(self.window, (213, 184, 99), rect, 1, border_radius=3)
             else:
                 reserved = 28 if self.dropdown_values(name) or name.startswith("test:") else 12
-                value = self.fit_setting_text(value, rect.w - reserved)
-                label = self.tooltip_font.render(value, True, (234, 222, 199))
+                prompt_button = name.startswith(("copy_", "restore_"))
+                font = self.prompt_button_font if prompt_button else self.tooltip_font
+                if not prompt_button:
+                    value = self.fit_text(value, max(1, rect.w - reserved), font)
+                label = font.render(value, True, (234, 222, 199))
+                if prompt_button and label.get_width() > max(1, rect.w - reserved):
+                    label = pygame.transform.smoothscale(label, (max(1, rect.w - reserved), label.get_height()))
                 center = ((rect.centerx + 8, rect.centery) if name.startswith("test:") else
                           (rect.centerx - 6, rect.centery) if self.dropdown_values(name) else rect.center)
                 self.window.blit(label, label.get_rect(center=center))
@@ -694,7 +717,7 @@ class CheckMateGui:
         bar = self.sidebar_rects["left"]
         pygame.draw.line(self.window, (71, 67, 59), (body.x, bar.bottom - 106), (body.right, bar.bottom - 106))
         message = self.settings_error or self.play_message
-        self.window.blit(self.tooltip_font.render(self.fit_setting_text(message, body.w), True, (210, 203, 186)), (body.x, bar.bottom - 94))
+        self.window.blit(self.exposure_font.render(self.fit_text(message, body.w, self.exposure_font), True, (210, 203, 186)), (body.x, bar.bottom - 94))
         if not self.play_can_start and self.play_state in {"idle", "ready", "stopped"}:
             hint = "Place time token first" if self.mode and self.play_message == "Initial token: human only" else "Waiting for an LLM turn"
             self.window.blit(self.tooltip_font.render(self.fit_setting_text(hint, body.w), True, (171, 161, 140)), (body.x, bar.bottom - 74))
@@ -894,6 +917,8 @@ class CheckMateGui:
     def select_thinking_turn(self, turn):
         if type(turn) is not int or turn < 1:
             return False
+        if turn != self.thinking_turn:
+            self.thinking_selection.clear()
         pane = self.exposure_panes["thinking"]
         self.thinking_scroll_positions[self.thinking_turn] = pane.scroll
         self.thinking_turn = turn
@@ -1028,6 +1053,7 @@ class CheckMateGui:
         for name, value in (("thinking", thinking), ("notes", notes)):
             if value is not None:
                 if name == "thinking":
+                    self.thinking_selection.clear()
                     self.thinking_turn = None
                     self.thinking_follow_latest = True
                     self.thinking_scroll_positions.clear()
@@ -1125,6 +1151,8 @@ class CheckMateGui:
             body = self.exposure_body(rect)
             visible = max(1, body.h // (self.exposure_font.get_linesize() + 3))
             follow_tail = pane.scroll >= max(0, self.exposure_line_count("thinking", body.w) - visible)
+        if self.thinking_selection.selected_text(self.thinking_messages()) or self.thinking_selection.dragging:
+            follow_tail = False
         entry = next((item for item in pane.messages if request_id is not None
                       and item.get("request_id") == request_id), None)
         if entry is None:
@@ -1133,11 +1161,14 @@ class CheckMateGui:
                 entry["request_id"] = request_id
             pane.messages.append(entry)
         else:
+            self.thinking_selection.replace_text(entry, str(text))
             entry.update(text=str(text), side=side, color=color)
         if type(turn) is int and turn > 0:
             entry["turn"] = turn
         turns = self.thinking_turns()
-        if turns and self.thinking_follow_latest and self.thinking_turn != turns[-1]:
+        if (turns and self.thinking_follow_latest and self.thinking_turn != turns[-1]
+                and not self.thinking_selection.selected_text(self.thinking_messages())
+                and not self.thinking_selection.dragging):
             self.select_thinking_turn(turns[-1])
             follow_tail = True
         pane.text = "\n\n".join(item["text"] for item in pane.messages)
@@ -1211,21 +1242,19 @@ class CheckMateGui:
             for match in re.finditer(r"\s+|[A-Za-z0-9_]+|.", paragraph):
                 token, position = match.group(), offset + match.start()
                 if line and self.exposure_font.size(line + token)[0] > width:
-                    lines.append(line.rstrip())
+                    lines.append(line)
                     starts.append(start)
-                    stripped = token.lstrip()
-                    start = position + len(token) - len(stripped)
-                    line, token, position = "", stripped, start
+                    start, line = position, ""
                 if self.exposure_font.size(line + token)[0] <= width:
                     line += token
                     continue
                 for index, char in enumerate(token):
                     if line and self.exposure_font.size(line + char)[0] > width:
-                        lines.append(line.rstrip())
+                        lines.append(line)
                         starts.append(start)
                         line, start = "", position + index
                     line += char
-            lines.append(line.rstrip())
+            lines.append(line)
             starts.append(start)
             offset += len(paragraph) + 1
         return lines, starts
@@ -1264,7 +1293,8 @@ class CheckMateGui:
             lines = self.chat_entry_lines(entry, wrap_width)
             height = len(lines) * line_height + padding * 2
             layout.append({**entry, "rect": pygame.Rect(inset if side == "white" else 0, top, item_width, height),
-                           "lines": lines, "padding": padding})
+                           "lines": lines, "padding": padding, "source": entry,
+                           "starts": entry["_wrap_cache"]["starts"]})
             top += height + 10
         count = (max(0, top - 10) + line_height - 1) // line_height
         self.chat_layout_cache = (key, layout, count)
@@ -1274,6 +1304,92 @@ class CheckMateGui:
         if name == "thinking" and self.thinking_messages():
             return self.chat_layout(width)[1]
         return len(self.exposure_lines(name, width))
+
+    def thinking_point_at(self, position):
+        rect = self.exposure_pane_rects().get("thinking")
+        if rect is None:
+            return None
+        body = self.exposure_body(rect)
+        layout = self.chat_layout(body.w)[0]
+        if not layout:
+            return None
+        line_height = self.exposure_font.get_linesize() + 3
+        y = position[1] - body.y + self.exposure_panes["thinking"].scroll * line_height
+        entry = next((item for item in layout if y < item["rect"].bottom), layout[-1])
+        row = max(0, min(len(entry["lines"]) - 1,
+                         (y - entry["rect"].y - entry["padding"]) // line_height))
+        line = entry["lines"][row]
+        x = position[0] - body.x - entry["rect"].x - entry["padding"]
+        # Midpoints choose character boundaries, even for mixed CJK/Latin text.
+        offset = 0
+        while offset < len(line):
+            left = self.exposure_font.size(line[:offset])[0]
+            right = self.exposure_font.size(line[:offset + 1])[0]
+            if x < (left + right) / 2:
+                break
+            offset += 1
+        return entry["source"], entry["starts"][row] + offset
+
+    def handle_thinking_selection_event(self, event):
+        selection = self.thinking_selection
+        if event.type == pygame.WINDOWFOCUSLOST:
+            selection.focused = selection.dragging = False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            rect = self.exposure_pane_rects().get("thinking")
+            if rect and self.exposure_body(rect).collidepoint(event.pos):
+                point = self.thinking_point_at(event.pos)
+                if point is not None:
+                    selection.start(point, bool(pygame.key.get_mods() & pygame.KMOD_SHIFT))
+                    selection.position = event.pos
+                    selection.scroll_due = pygame.time.get_ticks() + 60
+                    return True
+            selection.focused = selection.dragging = False
+        if event.type == pygame.MOUSEMOTION and selection.dragging:
+            selection.position = event.pos
+            point = self.thinking_point_at(event.pos)
+            if point is not None:
+                selection.cursor = point
+            return True
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and selection.dragging:
+            point = self.thinking_point_at(event.pos)
+            if point is not None:
+                selection.cursor = point
+            selection.dragging = False
+            return True
+        if selection.focused and not self.active_setting and not self.thinking_turn_editing:
+            if event.type == pygame.KEYDOWN:
+                if getattr(event, "mod", 0) & pygame.KMOD_CTRL and event.key == pygame.K_c:
+                    text = selection.selected_text(self.thinking_messages())
+                    if text:
+                        try:
+                            write_clipboard(text)
+                            selection.error = ""
+                        except (OSError, pygame.error, UnicodeError):
+                            selection.error = "Clipboard unavailable; try Ctrl+C again."
+                elif event.key == pygame.K_ESCAPE:
+                    selection.clear()
+                return True  # Read-only: paste, cut, delete and typing do nothing.
+            if event.type == pygame.TEXTINPUT:
+                return True
+        return False
+
+    def update_thinking_selection_scroll(self, now=None):
+        selection = self.thinking_selection
+        rect = self.exposure_pane_rects().get("thinking")
+        if not selection.dragging or selection.position is None or rect is None:
+            return
+        now = pygame.time.get_ticks() if now is None else now
+        if now < selection.scroll_due:
+            return
+        selection.scroll_due = now + 60
+        body = self.exposure_body(rect)
+        y = selection.position[1]
+        direction = -1 if y < body.top + 16 else 1 if y >= body.bottom - 16 else 0
+        if direction:
+            self.scroll_exposure_pane(body.center, direction)
+            point = self.thinking_point_at(selection.position)
+            if point is not None:
+                selection.cursor = point
 
     def draw_chat_messages(self, body, pane):
         line_height = self.exposure_font.get_linesize() + 3
@@ -1292,8 +1408,24 @@ class CheckMateGui:
             first = max(0, (body.top - rect.y - padding) // line_height)
             last = min(len(entry["lines"]), (body.bottom - rect.y - padding) // line_height + 1)
             for index in range(first, last):
+                source = entry.get("source")
+                selected = None
+                if source is not None:
+                    start, end = self.thinking_selection.range_for(source, self.thinking_messages())
+                    line_start = entry["starts"][index]
+                    line = entry["lines"][index]
+                    a, b = max(0, start - line_start), min(len(line), end - line_start)
+                    if b > a:
+                        x = rect.x + padding + self.exposure_font.size(line[:a])[0]
+                        width = self.exposure_font.size(line[a:b])[0]
+                        pygame.draw.rect(self.window, (55, 108, 174),
+                                         (x, rect.y + padding + index * line_height, width, line_height))
+                        selected = (x, line[a:b])
                 label = self.exposure_font.render(entry["lines"][index], True, foreground)
                 self.window.blit(label, (rect.x + padding, rect.y + padding + index * line_height))
+                if selected is not None:
+                    label = self.exposure_font.render(selected[1], True, (255, 255, 255), (55, 108, 174))
+                    self.window.blit(label, (selected[0], rect.y + padding + index * line_height))
 
     def scroll_exposure_pane(self, position, delta):
         for name, rect in self.exposure_pane_rects().items():
@@ -1307,6 +1439,7 @@ class CheckMateGui:
         return self.sidebar_rects["right"].collidepoint(position)
 
     def draw_exposure_panes(self):
+        self.update_thinking_selection_scroll()
         line_height = self.exposure_font.get_linesize() + 3
         original_clip = self.window.get_clip()
         for name, rect in self.exposure_pane_rects().items():
@@ -1347,6 +1480,11 @@ class CheckMateGui:
             self.window.set_clip(original_clip)
             if name == "thinking":
                 self.draw_scrollbar("thinking", self.sidebar_scrollbars().get("thinking"))
+                if self.thinking_selection.error:
+                    label = self.exposure_font.render(self.thinking_selection.error, True, (235, 74, 72))
+                    self.window.set_clip(body.clip(original_clip))
+                    self.window.blit(label, (body.x, body.bottom - line_height))
+                    self.window.set_clip(original_clip)
             elif count > visible:
                 track = pygame.Rect(rect.right - 7, body.y, 3, body.h)
                 height = min(track.h, max(12, round(track.h * visible / count)))

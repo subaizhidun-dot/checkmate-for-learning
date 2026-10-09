@@ -118,43 +118,46 @@ class AgentPlayTests(unittest.TestCase):
 
     def finish_response(self, *calls, content=None):
         if self.controller.request is None:
-            self.controller.next()
+            self.controller.tick()
+        self.assertIsNotNone(self.controller.request, "A response requires an authorized request")
         self.requests[-1].response = response(*calls, content=content)
         self.controller.tick()
         while self.controller.pending:
             self.controller.tick()
 
-    def test_step_reads_notes_then_selects_and_moves_with_explicit_clicks(self):
+    def test_one_next_reads_records_selects_and_moves_across_requests(self):
         session = self.app.state.session
         session.game.current_ap = session.game.max_ap = 3
         self.controller.next()
-        for name in ("get_notes", "get_legal_actions"):
-            self.finish_response((name, {}))
-            count = len(self.requests)
+        for name, args in (("get_notes", {}), ("get_legal_actions", {}),
+                           ("record_intent", {"text": "Move after checking legality"})):
+            before = session.snapshot()
+            self.finish_response((name, args))
+            self.assertEqual(session.snapshot()["board"], before["board"])
+            self.assertEqual(session.game.current_ap, 3)
+            self.assertEqual(self.controller.state, "running")
             self.controller.tick()
-            self.assertEqual(len(self.requests), count)
-            self.controller.next()
         messages = self.requests[-1].payload["messages"]
         self.assertFalse(any(isinstance(m.get("content"), list) for m in messages))
         assistants = [m for m in messages if m["role"] == "assistant"]
-        self.assertEqual(len(assistants), 2)
+        self.assertEqual(len(assistants), 3)
         self.assertTrue(all(m["reasoning_content"] == "Provider-returned reasoning" for m in assistants))
         self.finish_response(("apply_action", {"action_id": "select_piece:at=2,1", "revision": session.revision}))
         self.assertEqual(session.flow.phase, "select_target")
         self.assertEqual(session.game.current_ap, 3)
-        self.assertEqual(self.controller.state, "ready")
+        self.assertEqual(self.controller.state, "running")
         self.controller.tick()
-        self.assertEqual(len(self.requests), 3)
-        self.controller.next()
+        self.assertEqual(len(self.requests), 5)
         self.finish_response(("apply_action", {"action_id": "move:from=2,1;to=3,1", "revision": session.revision}))
         self.assertEqual(session.game.get_piece((3, 1)).owner, "black")
         self.assertEqual(session.game.current_ap, 2)
         self.assertEqual(self.controller.state, "ready")
         self.controller.tick()
-        self.assertEqual(len(self.requests), 4)
-        self.assertEqual(session.llm_usage.summary()["requests"], 4)
+        self.assertEqual(len(self.requests), 5)
+        self.assertIsNone(self.controller.step_permit)
+        self.assertEqual(session.llm_usage.summary()["requests"], 5)
         self.assertEqual(session.llm_usage.summary()["llm_turns"], 1)
-        self.assertEqual(session.llm_usage.summary()["total_tokens"], 40)
+        self.assertEqual(session.llm_usage.summary()["total_tokens"], 50)
 
     def test_direct_move_finishes_one_step_without_selection_request(self):
         session = self.app.state.session
@@ -167,14 +170,14 @@ class AgentPlayTests(unittest.TestCase):
         self.assertEqual(self.controller.state, "ready")
         self.assertEqual(session.game.current_ap, 2)
 
-    def test_elephant_bonus_waits_for_next_when_it_needs_another_request(self):
+    def test_elephant_bonus_continues_automatically_after_ap_is_spent(self):
         session = self.app.state.session
         session.game.current_ap = session.game.max_ap = 3
         self.controller.next()
         self.finish_response(("move_piece", {"source": [2, 3], "target": [3, 3],
                                               "revision": session.revision, "request_id": "push"}))
         self.assertEqual(session.flow.phase, "pending_elephant_bonus")
-        self.assertEqual(self.controller.state, "ready")
+        self.assertEqual(self.controller.state, "running")
         self.controller.tick()
         self.finish_response(("apply_action", {"action_id": "place_elephant_bonus:at=2,3", "revision": session.revision}))
         self.assertEqual(session.game.get_piece((2, 3)).kind, "squirrel")
@@ -194,6 +197,25 @@ class AgentPlayTests(unittest.TestCase):
         self.assertEqual(self.controller.state, "ready")
         self.assertEqual(len(self.requests), 1)
 
+    def test_one_next_finishes_elephant_bonus_and_required_piece_removal(self):
+        from test_transaction_legality import sized_army
+        session = self.app.state.session = sized_army()
+        self.app.agent_tools_by_side = {side: AgentTools(session, side) for side in ("black", "white")}
+        self.controller.next()
+        self.finish_response(("move_piece", {"source": [2, 3], "target": [3, 3],
+                                              "revision": session.revision, "request_id": "bonus-limit"}))
+        self.finish_response(("apply_action", {"action_id": "place_elephant_bonus:at=2,3", "revision": session.revision}))
+        self.assertEqual(session.flow.phase, "pending_piece_limit")
+        self.assertEqual(self.controller.state, "running")
+        self.finish_response(("apply_action", {"action_id": "remove_piece_limit:at=2,3", "revision": session.revision}))
+        self.assertEqual(session.game.current_ap, 2)
+        self.assertEqual(session.players["black"].num_pieces, 7)
+        self.assertEqual(self.controller.state, "ready")
+        for _ in range(4):
+            self.controller.tick()
+        self.assertEqual(len(self.requests), 3)
+        self.assertIsNone(self.controller.step_permit)
+
     def test_purchase_payment_and_placement_continue_until_committed(self):
         session = self.app.state.session
         session.game.current_ap = session.game.max_ap = 3
@@ -206,7 +228,7 @@ class AgentPlayTests(unittest.TestCase):
                  "select_cost:at=4,4;kind=butterfly", "buy_butterfly:at=3,3"]
         for index, action_id in enumerate(steps):
             self.finish_response(("apply_action", {"action_id": action_id, "revision": session.revision}))
-            self.assertEqual(self.controller.state, "ready")
+            self.assertEqual(self.controller.state, "ready" if index == len(steps)-1 else "running")
             self.controller.tick()
         self.assertEqual(session.game.get_piece((3, 3)).kind, "butterfly")
         self.assertEqual(session.game.current_ap, 2)
@@ -220,7 +242,7 @@ class AgentPlayTests(unittest.TestCase):
         self.controller.next()
         for index, action_id in enumerate(("sell_butterfly:at=4,3", "place_refund:at=4,3", "place_refund:at=4,4")):
             self.finish_response(("apply_action", {"action_id": action_id, "revision": session.revision}))
-            self.assertEqual(self.controller.state, "ready")
+            self.assertEqual(self.controller.state, "ready" if index == 2 else "running")
             self.controller.tick()
         self.assertEqual(session.game.current_ap, 2)
         self.assertEqual(session.game.get_piece((4, 3)).kind, "squirrel")
@@ -243,18 +265,22 @@ class AgentPlayTests(unittest.TestCase):
         self.assertEqual(self.controller.state, "ready")
 
     def test_repeated_read_tools_stop_at_the_decision_request_limit(self):
-        self.app.gui.play_control_mode = "auto"
-        self.controller.next()
-        for _ in range(MAX_DECISION_REQUESTS):
-            self.finish_response(("get_notes", {}))
-            self.controller.tick()
-        self.assertEqual(len(self.requests), MAX_DECISION_REQUESTS)
-        self.assertEqual(self.controller.state, "stopped")
-        self.assertIn("request limit", self.controller.message)
-        self.controller.tick()
-        self.assertEqual(len(self.requests), MAX_DECISION_REQUESTS)
-        self.controller.next()
-        self.assertEqual(len(self.requests), MAX_DECISION_REQUESTS + 1)
+        for mode in ("step", "auto"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.app.gui.play_control_mode = mode
+                self.controller.next()
+                for _ in range(MAX_DECISION_REQUESTS):
+                    self.finish_response(("get_notes", {}))
+                    self.controller.tick()
+                self.assertEqual(len(self.requests), MAX_DECISION_REQUESTS)
+                self.assertEqual(self.controller.state, "stopped")
+                self.assertIn("request limit", self.controller.message)
+                self.assertIsNone(self.controller.step_permit)
+                self.controller.tick()
+                self.assertEqual(len(self.requests), MAX_DECISION_REQUESTS)
+                self.controller.next()
+                self.assertEqual(len(self.requests), MAX_DECISION_REQUESTS + 1)
 
     def test_stop_mid_reply_preserves_matched_tool_results_for_resumption(self):
         self.start_response(("get_notes", {}), ("update_notes", {"text": "Do not run"}))
@@ -295,7 +321,7 @@ class AgentPlayTests(unittest.TestCase):
         self.controller.next()
         for name in ("get_public_state", "get_legal_actions", "get_gi_rules", "get_notes"):
             self.finish_response((name, {}))
-            self.controller.next()
+            self.controller.tick()
         messages = self.requests[-1].payload["messages"]
         encoded = json.dumps(messages)
         self.assertEqual(encoded.count('\\"board\\":'), 1)
@@ -346,7 +372,7 @@ class AgentPlayTests(unittest.TestCase):
         self.controller.next()
         self.finish_response(("get_notes", {}))
         self.controller.cached_images["black"] = {1: {"index": 1, "mime_type": "image/png", "data": "test-image"}}
-        self.controller.next()
+        self.controller.tick()
         self.assertNotIn("image_url", json.dumps(self.requests[-1].payload))
         self.assertNotIn("test-image", json.dumps(self.requests[-1].payload))
         self.controller.stop(reset=True)
@@ -384,7 +410,7 @@ class AgentPlayTests(unittest.TestCase):
         self.finish_response(("move_piece", {"source": [2, 3], "target": [3, 3],
                                               "revision": session.revision, "request_id": "last-ap"}))
         self.assertEqual(session.game.current_ap, 0)
-        self.assertEqual(self.controller.state, "ready")
+        self.assertEqual(self.controller.state, "running")
         self.controller.tick()
         self.finish_response(("apply_action", {"action_id": "skip_elephant_bonus", "revision": session.revision}))
         self.assertEqual(session.game.current_player, "white")
@@ -439,11 +465,9 @@ class AgentPlayTests(unittest.TestCase):
         self.assertEqual(self.app.state.session.flow.agent_intents["black"][-1]["text"], "First hypothesis")
         self.controller.tick()
         self.assertEqual(self.app.state.session.flow.agent_intents["black"][-1]["text"], "Second hypothesis")
-        self.assertEqual(self.controller.state, "ready")
+        self.assertEqual(self.controller.state, "running")
         self.assertTrue(self.controller.received)
         self.controller.tick()
-        self.assertEqual(len(self.requests), 1)
-        self.controller.next()
         self.assertEqual(len(self.requests), 2)
         self.assertEqual(self.app.state.session.llm_usage.summary()["total_tokens"], 10)
 

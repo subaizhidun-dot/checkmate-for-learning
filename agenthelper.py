@@ -30,11 +30,12 @@ from pathlib import Path
 from typing import Any
 
 import gameengine as engine
+from app_paths import application_dir
 from gameengine import GameSession
 from save_policy import AutosavePolicy
 
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = application_dir()
 DEFAULT_AGENT_SAVES_DIR = BASE_DIR / "saves" / "agent"
 
 

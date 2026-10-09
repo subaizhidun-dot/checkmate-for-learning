@@ -10,7 +10,9 @@ SYSTEM_PROMPT = (
     "Balance information gain against the opponent winning and your future mobility. "
     "Testing means changing the board and awaiting the program check at turn end; predictions are not verified facts. "
     "Before an experiment or winning plan, call record_intent with the relevant numbered hypotheses, planned changes "
-    "and predicted condition results. Continue or revise that plan as needed. "
+    "and predicted condition results. record_intent only records predictions and never executes them. "
+    "Use actual action tools to execute a recorded plan. Tool results return automatically while the decision is unfinished. "
+    "Continue or revise that plan as needed. "
     "Condition notes are updated only by a separate review after public feedback. No hidden victory formula is available. "
     "Tool results accompany the next permitted request so you can continue the same decision. "
     "The latest user context contains the authoritative board, AP, phase, revision, pending operations and legal actions. "
@@ -77,6 +79,21 @@ DEFAULT_PROMPTS = {
     "notes_prompt": NOTES_PROMPT,
     "ng_plus_prompt": NG_PLUS_PROMPT,
 }
+
+# Program protocol accompanies custom prompts without rewriting local preferences.
+ACTION_EXECUTION_PROTOCOL = (
+    "Execution protocol: record_intent and read tools do not move pieces or spend AP. "
+    "Execute legal choices through move_piece, apply_action or submit_plan; standard games may record intent before acting. "
+    "Plan text is never executed. Calls execute in order after the complete reply is validated. "
+    "One Next authorizes one complete decision in Step mode. Read tools, intent recording, selection and unfinished "
+    "payment/refund/bonus steps return results automatically for follow-up requests in that decision. "
+    "The decision stops after an AP-spending operation and its pending steps finish, after the reply's ordered plan, "
+    "or at a turn/check/extra-turn boundary. Another Step decision requires Next. "
+    "For submit_plan, each entry uses a game action type and game parameters from get_legal_actions.actions. "
+    "Examples: {\"type\":\"place_squirrel\",\"params\":{\"at\":[3,2]}}; "
+    "movement uses select_piece with at, then move with from/to. Tool names apply_action and move_piece "
+    "are not game action types. Respect tool permissions, legal actions and turn boundaries."
+)
 
 
 def configured_prompt(gui, name):
