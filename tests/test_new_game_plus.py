@@ -26,6 +26,15 @@ def terminal(mode, token=None):
     return s
 
 
+def completed_wish(mode=2):
+    s = GameSession.new_game(mode)
+    s.game.time_token_owner = "white"
+    s.flow.phase = PHASE_TIME_WISH
+    s.flow.time_wish_winner = "black"
+    act(s, "time_wish", side="white")
+    return s
+
+
 class NewGamePlusTests(unittest.TestCase):
     def test_fresh_starts_are_standard_in_every_mode(self):
         for mode in (1, 2, 3):
@@ -34,9 +43,22 @@ class NewGamePlusTests(unittest.TestCase):
             self.assertFalse(s.can_start_new_game_plus())
             self.assertEqual({a["type"] for a in s.legal_actions()}, {"choose_initial_token"})
 
-    def test_eligibility_uses_any_owned_piece_and_known_winner(self):
+    def test_eligibility_requires_completed_g2_or_g3_wish(self):
         self.assertFalse(GameSession().can_start_new_game_plus())
-        s = terminal(1, token="white")
+        for mode in (1, 2, 3):
+            for token in (None, "white"):
+                s = terminal(mode, token)
+                self.assertFalse(s.can_start_new_game_plus())
+                self.assertEqual(GameSession.new_game(1, previous_session=s).flow.phase, PHASE_CHOOSE_TOKEN)
+        for mode in (2, 3):
+            s = completed_wish(mode)
+            self.assertTrue(s.can_start_new_game_plus())
+            s.flow.phase = PHASE_TIME_WISH
+            self.assertFalse(s.can_start_new_game_plus())
+            s.flow.phase = PHASE_GAME_OVER
+            s.game.time_token_owner = "white"
+            self.assertFalse(s.can_start_new_game_plus())
+        s = completed_wish()
         self.assertTrue(s.can_start_new_game_plus())
         self.assertTrue(s.snapshot()["new_game_plus_available"])
         s.game.board_matrix = [[None for _ in range(9)] for _ in range(7)]
@@ -46,17 +68,17 @@ class NewGamePlusTests(unittest.TestCase):
         s.game.set_piece((4, 3), Resource("white", "squirrel"))
         self.assertTrue(s.can_start_new_game_plus())
         s.mat_loser = s.game.mate_loser = None
+        s.flow.time_wish_winner = None
         self.assertFalse(s.can_start_new_game_plus())
-        # The wish phase already has a winner; no extra token/phase gate.
         s.flow.phase = PHASE_TIME_WISH
         s.flow.time_wish_winner = "white"
-        self.assertTrue(s.can_start_new_game_plus())
+        self.assertFalse(s.can_start_new_game_plus())
 
-    def test_all_nine_cross_mode_starts_use_fresh_base_positions(self):
-        for source_mode in (1, 2, 3):
+    def test_completed_wishes_can_start_any_target_mode(self):
+        for source_mode in (2, 3):
             for target_mode in (1, 2, 3):
                 with self.subTest(source=source_mode, target=target_mode):
-                    source = terminal(source_mode, token="white")
+                    source = completed_wish(source_mode)
                     source.game.current_player = "white"
                     source.game.current_ap = source.game.max_ap = 30
                     source.game.new_piece = [(2, 1)]
@@ -88,7 +110,7 @@ class NewGamePlusTests(unittest.TestCase):
     def test_saved_ng_plus_resumes_play_and_future_turns_without_a_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             for mode in (1, 2, 3):
-                s = GameSession.new_game(mode, previous_session=terminal(1))
+                s = GameSession.new_game(mode, previous_session=completed_wish())
                 p = save_session_file(s, Path(directory) / f"g{mode}.json")
                 data = json.loads(p.read_text())
                 self.assertFalse(any(key in data for key in ("ng_plus", "is_ng_plus", "gi_plus")))
@@ -113,7 +135,7 @@ class NewGamePlusTests(unittest.TestCase):
                 standard = GameSession.new_game(mode)
                 save_session_file(standard, p)
                 self.assertEqual(load_session_file(p).flow.phase, PHASE_CHOOSE_TOKEN)
-                ng = GameSession.new_game(mode, previous_session=terminal(2))
+                ng = GameSession.new_game(mode, previous_session=completed_wish())
                 act(ng, "select_piece", at=[2, 1])
                 save_session_file(ng, p)
                 selected = load_session_file(p)
@@ -124,7 +146,7 @@ class NewGamePlusTests(unittest.TestCase):
 
     def test_pending_elephant_bonus_and_refund_resume_without_token(self):
         with tempfile.TemporaryDirectory() as directory:
-            s = GameSession.new_game(3, previous_session=terminal(1))
+            s = GameSession.new_game(3, previous_session=completed_wish())
             s.game.current_ap = s.game.max_ap = 5
             act(s, "select_piece", at=[2, 3])
             act(s, "move", **{"from": [2, 3], "to": [3, 3]})
@@ -143,9 +165,9 @@ class NewGamePlusTests(unittest.TestCase):
             self.assertEqual(restored.flow.phase, PHASE_PLAYING)
             self.assertTrue(restored.game.g3_turn.resources_changed)
 
-    def test_loaded_terminal_and_ng_plus_terminal_allow_another_mode(self):
+    def test_loaded_completed_wish_unlocks_but_ng_plus_mate_does_not(self):
         with tempfile.TemporaryDirectory() as directory:
-            p = save_session_file(terminal(1), Path(directory) / "terminal.json")
+            p = save_session_file(completed_wish(), Path(directory) / "terminal.json")
             restored = load_session_file(p)
             self.assertTrue(restored.can_start_new_game_plus())
             ng = GameSession.new_game(2, previous_session=restored)
@@ -154,12 +176,13 @@ class NewGamePlusTests(unittest.TestCase):
             ng_terminal = load_session_file(p)
             self.assertEqual(ng_terminal.result()["winner"], "white")
             next_ng = GameSession.new_game(3, previous_session=ng_terminal)
-            self.assertEqual(next_ng.flow.phase, PHASE_PLAYING)
+            self.assertFalse(ng_terminal.can_start_new_game_plus())
+            self.assertEqual(next_ng.flow.phase, PHASE_CHOOSE_TOKEN)
             self.assertIsNone(next_ng.game.time_token_owner)
 
     def test_older_finished_wish_restores_winner_from_saved_flow(self):
         with tempfile.TemporaryDirectory() as directory:
-            s = terminal(2)
+            s = completed_wish()
             s.flow.time_wish_winner = "black"
             s.mat_loser = s.game.mate_loser = None
             p = save_session_file(s, Path(directory) / "wish.json")

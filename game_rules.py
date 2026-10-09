@@ -38,13 +38,13 @@ MODE_RULES = {
         "shop": {"mole": {"buy": 2, "sell": 1}, "lion": {"buy": 4, "sell": 2}},
         "instructions": [
             "A tree counts as a piece and cannot be bought, sold or removed to resolve the piece limit. A rooted tree cannot move.",
-            "Uproot an own tree for 1 AP; no mole is needed. An uprooted tree moves one diagonal step into an empty playable cell for 1 AP, or 2 AP under enemy lion control.",
+            "Uproot an own tree for 1 AP, or an enemy tree for 2 AP with an own lion; no mole is needed and the tree keeps its owner. An uprooted tree moves one diagonal step into an empty playable cell for 1 AP, or 2 AP under enemy lion control.",
             "Once a tree leaves an initial tree position, a red marker remains underneath occupying pieces.",
             "A mole moves one orthogonal step into an empty playable cell for 1 AP.",
             "With an own mole anywhere on the board, plant an own uprooted tree on either red marker for 1 AP. With an own mole and an own lion, plant an enemy tree there for 2 AP; its owner stays the same.",
             "Uprooting at the left marker shifts the lower-left corner downward; uprooting at the right marker shifts the upper-right corner upward. The tile carries its occupant. Its vacated cell becomes an unusable rift; the shifted tile remains playable.",
             "Planting at the left or right marker restores its corresponding corner and occupant. This link follows the planting position rather than the tree's owner.",
-            "After a G2 victory, the time token holder spends the token in the time-wish phase. Save the ended game to start New Game+.",
+            "After a G2 victory, the human user completes the time wish and destroys the time token. Model play stops for this phase. The completed wish unlocks New Game+; save the ended game before starting it.",
         ],
     },
     3: {
@@ -56,7 +56,7 @@ MODE_RULES = {
             "Activate an own butterfly for 1 AP to end the turn and check victory. If victory fails and AP remains, start an extra turn with the remaining AP and time token. This does not refill AP or increase maximum AP.",
             "The extra turn has a new starting position. Newly placed piece restrictions reset. No butterfly can start another extra turn within that extra turn.",
             "A newly placed butterfly cannot move or activate its ability in that turn. Enemy lion control permits butterfly movement only.",
-            "After a G3 victory, the time token holder spends the token in the time-wish phase. Save the ended game to start New Game+.",
+            "After a G3 victory, the human user completes the time wish and destroys the time token. Model play stops for this phase. The completed wish unlocks New Game+; save the ended game before starting it.",
         ],
     },
 }

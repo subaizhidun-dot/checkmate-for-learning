@@ -5,8 +5,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from basicgame import Resource, Chessboard, get_legal_moves_for_piece, is_player_accessible
-from game3 import START_PATTERN, END_PATTERN, G3Turn, matches_pattern, own_positions, get_g3_condition_results
+from game3 import START_PATTERN, END_PATTERN, G3Turn, matches_pattern, normalized, own_positions, get_g3_condition_results
 from gameengine import GameSession, PHASE_PLAYING, PHASE_CHECKING_WIN, PHASE_TIME_WISH, PHASE_GAME_OVER, EngineError, encode_action_id, save_session_file, load_session_file
 
 
@@ -32,6 +33,43 @@ def add(session, position, kind, owner="black"):
 
 
 class G3Tests(unittest.TestCase):
+    def formation_results(self, start, end, moves=0):
+        board = Chessboard(3, [[None for _ in range(9)] for _ in range(7)])
+        board.time_token_owner = "white"
+        for x, y in normalized(end):
+            board.set_piece((x + 3, y + 2), Resource("black", "squirrel"))
+        board.g3_turn = G3Turn(start_positions={(x + 2, y + 1) for x, y in normalized(start)}, move_count=moves)
+        return get_g3_condition_results(None, board)
+
+    def test_second_condition_requires_exactly_one_move(self):
+        for moves in (0, 1, 2, 3):
+            with self.subTest(moves=moves):
+                results = self.formation_results(START_PATTERN, END_PATTERN, moves)
+                self.assertEqual(results[1], moves == 1)
+                self.assertEqual(results[3:], [True, True])
+
+    def test_qualifying_start_requires_relative_half_turn_for_each_orientation(self):
+        start = START_PATTERN
+        for orientation in range(4):
+            end = start
+            for rotation in range(4):
+                with self.subTest(start_orientation=orientation, end_rotation=rotation):
+                    results = self.formation_results(start, end)
+                    self.assertTrue(results[3])
+                    self.assertEqual(results[4], rotation == 2)
+                end = {(-y, x) for x, y in end}
+            start = {(-y, x) for x, y in start}
+
+    def test_nonqualifying_start_allows_each_ending_orientation(self):
+        end = END_PATTERN
+        for _ in range(4):
+            for start in (START_PATTERN | {(4, 4)}, START_PATTERN - {(0, 0)}):
+                results = self.formation_results(start, end)
+                self.assertEqual(results[3:], [False, True])
+            end = {(-y, x) for x, y in end}
+        self.assertFalse(self.formation_results(set(), {(-x, y) for x, y in END_PATTERN})[4])
+        self.assertFalse(self.formation_results(set(), END_PATTERN | {(4, 4)})[4])
+
     def test_setup_mode_isolation_and_agent(self):
         s = ready()
         self.assertEqual(s.players["black"].num_squirrels, 2)
@@ -228,9 +266,24 @@ assert "pygame" not in sys.modules
         s.game.g3_turn = G3Turn.capture(s.game)
         return s
 
-    def test_g3_legal_move_wins_then_wish_ends_without_save(self):
+    def test_opponent_move_cannot_win_with_unchanged_own_formation(self):
         s = self.winning_position()
         move(s, (6, 5), (5, 5))
+        self.assertEqual(s.flow.last_condition_results, [True, True, True, True, False])
+        self.assertEqual(s.flow.phase, PHASE_PLAYING)
+        self.assertIsNone(s.result()["winner"])
+
+    def test_no_move_cannot_pass_second_and_fifth_conditions(self):
+        s = self.winning_position()
+        act(s, "fast_time_token")
+        self.assertEqual(s.flow.last_condition_results, [True, False, True, True, False])
+        self.assertIsNone(s.result()["winner"])
+
+    def test_g3_successful_check_then_wish_ends_without_save(self):
+        s = self.winning_position()
+        # Isolate wish handling from formation predicates, tested above.
+        with patch.dict("gameengine.MODE_CONDITIONS", {3: lambda *_: [True] * 5}):
+            move(s, (6, 5), (5, 5))
         self.assertEqual(s.flow.last_condition_results, [True] * 5)
         self.assertEqual(s.flow.phase, PHASE_TIME_WISH)
         with tempfile.TemporaryDirectory() as directory:
@@ -247,7 +300,12 @@ assert "pygame" not in sys.modules
         s.game.current_ap = 4
         move(s, (6, 5), (5, 5))
         self.assertEqual(s.flow.phase, PHASE_PLAYING)
-        act(s, "butterfly_extra_turn", at=[3, 2])
+        def check_old_turn(player, board):
+            self.assertEqual(board.g3_turn.move_count, 1)
+            self.assertFalse(board.g3_turn.extra_turn)
+            return [True] * 5
+        with patch.dict("gameengine.MODE_CONDITIONS", {3: check_old_turn}):
+            act(s, "butterfly_extra_turn", at=[3, 2])
         self.assertEqual(s.flow.last_condition_results, [True] * 5)
         self.assertEqual(s.flow.phase, PHASE_TIME_WISH)
         self.assertEqual(s.flow.time_wish_winner, "black")

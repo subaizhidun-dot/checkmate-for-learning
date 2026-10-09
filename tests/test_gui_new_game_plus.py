@@ -11,6 +11,52 @@ import ui_text
 
 
 class NewGamePlusGuiTests(unittest.TestCase):
+    def test_llm_wish_is_human_controlled_after_load_and_unlocks_only_after_click(self):
+        import gui
+        for mode in (2, 3):
+            for holder in ("black", "white"):
+                with self.subTest(mode=mode, holder=holder), tempfile.TemporaryDirectory() as directory:
+                    self.app.start_game(mode)
+                    session = self.app.state.session
+                    self.app.gui.agent_play_mode = True
+                    self.app.gui.player_types = {"black": "llm", "white": "llm"}
+                    self.app.apply_settings()
+                    session.game.time_token_owner = holder
+                    session.flow.time_wish_winner = "white" if holder == "black" else "black"
+                    session.flow.phase = PHASE_TIME_WISH
+                    path = save_session_file(session, Path(directory) / "pending.json")
+                    with patch("main.SAVES_DIR", Path(directory)):
+                        self.app.load_from_file(path.name)
+                    session = self.app.state.session
+                    self.render()
+                    self.assertFalse(self.app.state.new_game_plus_available)
+                    self.assertEqual(self.app.gui.start_menu_labels(), ["Start G1", "Start G2", "Start G3"])
+                    self.assertFalse(self.app.gui.play_can_start)
+                    self.assertEqual(self.app.gui.play_message, "Time wish: human only")
+                    self.assertIn("Human control", session.pending_message)
+                    self.assertEqual(self.app.get_legal_targets(), (set(), set(), {holder}))
+                    panel = gui.LEFT_CAMP_RECT if holder == "black" else gui.RIGHT_CAMP_RECT
+                    pixel = (panel.left + gui.LEGAL_HINT_INSET, panel.top + gui.LEGAL_HINT_INSET)
+                    self.assertEqual(tuple(self.app.gui.screen.get_at(pixel))[:3], gui.LEGAL_HINT_COLOR)
+                    self.click(f"camp:{holder}")
+                    self.assertIsNone(session.game.time_token_owner)
+                    self.assertTrue(session.can_start_new_game_plus())
+                    self.assertEqual(self.app.gui.player_types, {"black": "llm", "white": "llm"})
+                    self.assertEqual(self.app.gui.start_menu_labels(), ["Start G1+", "Start G2+", "Start G3+"])
+
+    def test_g1_victory_has_no_wish_or_ng_plus_menu(self):
+        self.app.start_g1()
+        session = self.app.state.session
+        session.game.time_token_owner = "white"
+        session.flow.last_condition_results = [True] * 5
+        session.resolve_turn_end()
+        self.app.after_engine_change()
+        self.render()
+        self.assertTrue(session.is_over())
+        self.assertNotIn("New Game+", session.pending_message)
+        self.assertFalse(session.can_start_new_game_plus())
+        self.assertEqual(self.app.gui.start_menu_labels(), ["Start G1", "Start G2", "Start G3"])
+
     def setUp(self):
         self.environment = patch.dict(os.environ, {
             "SDL_VIDEODRIVER": "dummy", "SDL_AUDIODRIVER": "dummy", "PYGAME_HIDE_SUPPORT_PROMPT": "1",
@@ -58,10 +104,12 @@ class NewGamePlusGuiTests(unittest.TestCase):
     def test_save_terminal_load_cross_mode_start_and_resave_playing_state(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch("main.SAVES_DIR", Path(directory)), patch("sl_func.SAVES_DIR", Path(directory)):
-                self.app.start_g1()
+                self.app.start_g2()
                 source = self.app.state.session
                 source.game.time_token_owner = "white"
-                source.end_session("check_victory", loser="white")
+                source.flow.phase = PHASE_TIME_WISH
+                source.flow.time_wish_winner = "black"
+                source.select_camp("white")
                 self.render()
                 self.assertEqual(self.app.gui.start_menu_labels(), ["Start G1+", "Start G2+", "Start G3+"])
                 path = self.app.save_slot(1)
@@ -87,9 +135,10 @@ class NewGamePlusGuiTests(unittest.TestCase):
                 self.assertIsNone(self.app.state.time_token_owner)
                 self.app.state.session.end_session("mate", loser="black")
                 self.render()
+                self.assertFalse(self.app.state.new_game_plus_available)
                 self.start(2)
                 self.assertEqual(self.app.state.gamemode, 2)
-                self.assertEqual(self.app.state.session.flow.phase, PHASE_PLAYING)
+                self.assertEqual(self.app.state.session.flow.phase, PHASE_CHOOSE_TOKEN)
                 self.assertIsNone(self.app.state.time_token_owner)
                 self.assertTrue(self.app.state.game.get_piece((2, 3)).rooted)
                 self.assertEqual(self.app.state.game.tree_markers, set())
@@ -102,6 +151,8 @@ class NewGamePlusGuiTests(unittest.TestCase):
         session.flow.phase = PHASE_TIME_WISH
         session.flow.time_wish_winner = "black"
         session.game.time_token_owner = session.game.current_player = "white"
+        self.render()
+        self.assertFalse(self.app.gui.new_game_plus_available)
         self.click("camp:white")
         self.assertEqual(session.pending_message, "Save this game, then start New Game+.")
         self.assertEqual(session.result()["winner"], "black")

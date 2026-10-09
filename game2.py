@@ -73,16 +73,17 @@ def tree_action(board, position):
     tree = board.get_piece(position)
     if tree is None or tree.kind != "tree" or position not in PLANTING_CORNERS:
         return None
-    if tree.rooted:
-        return "uproot_tree" if tree.owner == board.current_player else None
     own_kinds = {
         piece.kind
         for row in board.board_matrix for piece in row
         if piece is not None and piece.owner == board.current_player
     }
+    if (not (tree.owner == board.current_player or "lion" in own_kinds)
+            or board.current_ap < tree_action_cost(board, position)):
+        return None
+    if tree.rooted:
+        return "uproot_tree"
     if (position in board.tree_markers and is_g2_player_access(position, board)
-            and "mole" in own_kinds
-            and (tree.owner == board.current_player or "lion" in own_kinds)
-            and board.current_ap >= tree_action_cost(board, position)):
+            and "mole" in own_kinds):
         return "plant_tree"
     return None

@@ -23,7 +23,10 @@ from basicgame import (
     Playerstate,
     Resource,
     SPECIAL_KINDS,
+    SELL_REFUND,
+    MODE_SPECIALS,
     can_buy_special,
+    can_sell_special,
     can_select_piece,
     can_select_resource,
     get_empty_accessible_cells,
@@ -86,9 +89,7 @@ ACTION_TYPE_CANCEL = "cancel"
 ACTION_TYPE_SELECT_PIECE = "select_piece"
 
 BUY_COST = {"elephant": 2, "lion": 4, "mole": 2, "butterfly": 4}
-SELL_REFUND = {"elephant": 1, "lion": 2, "mole": 1, "butterfly": 2}
 REVERSED_BUY = {kind: f"buy_{kind}" for kind in BUY_COST}
-MODE_SPECIALS = {1: ("elephant", "lion"), 2: ("mole", "lion"), 3: ("elephant", "lion", "butterfly")}
 MODE_CONDITIONS = {1: get_g1_condition_results, 2: get_g2_condition_results, 3: get_g3_condition_results}
 
 # Stable error codes returned to the agent.  They never change the game state.
@@ -162,6 +163,12 @@ class GameFlow:
     checking_action_message: str = ""
     temp_removed: list[tuple[Position, Resource]] = field(default_factory=list)
     temp_placed: list[Position] = field(default_factory=list)
+    temp_new_pieces: list[Position] | None = None
+    last_public_check: dict | None = None
+    public_check_archive: list[dict] = field(default_factory=list)
+    turn_start_board: list | None = None
+    turn_actions: list[dict] = field(default_factory=list)
+    agent_intents: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -223,6 +230,7 @@ class GameSession:
         self.request_cache: dict[str, dict[str, Any]] = {}
         self.action_log: list[ActionLogEntry] = []
         self.agent_notes: dict[str, str] = {}
+        self.public_check_events: list[dict] = []
         self.llm_usage = LLMUsage()
         self.turn_number = 1
         self.pending_message = ""
@@ -247,6 +255,8 @@ class GameSession:
             if players is None:
                 self.refresh_players()
         self.bind_runtime_links()
+        if game is not None and self.flow.turn_start_board is None:
+            self.flow.turn_start_board = serialize_board(game.board_matrix)
 
     # ------------------------------------------------------------------
     # Setup and bookkeeping
@@ -312,9 +322,13 @@ class GameSession:
             self.game.g3_turn.resources_changed |= resources_changed
 
     def can_start_new_game_plus(self) -> bool:
-        """The displayed position has a piece and a known winner."""
+        """NG+ follows a completed G2/G3 wish that destroyed the time token."""
         return (
             self.game is not None
+            and self.game.gamemode in {2, 3}
+            and self.flow.phase == PHASE_GAME_OVER
+            and self.game_over_reason == "time_wish"
+            and self.game.time_token_owner is None
             and self.result()["winner"] in {"black", "white"}
             and any(piece is not None and piece.is_piece and piece.owner in {"black", "white"}
                     for row in self.game.board_matrix for piece in row)
@@ -349,6 +363,7 @@ class GameSession:
         ok: bool,
         error_code: str | None = None,
         detail: str = "",
+        checks_before: int | None = None,
     ) -> None:
         self.action_log.append(
             ActionLogEntry(
@@ -365,6 +380,16 @@ class GameSession:
         )
         if len(self.action_log) > self.MAX_LOG_ENTRIES:
             del self.action_log[: len(self.action_log) - self.MAX_LOG_ENTRIES]
+        # Immediate checks run inside the action handler, before its log entry.
+        # Complete their evidence now and keep this action out of the next turn.
+        entry = self.action_log[-1].as_dict()
+        public_action = {key: entry[key] for key in ("actor", "action_type", "params", "revision_after")}
+        completed = self.public_check_events[checks_before:] if checks_before is not None else []
+        if completed:
+            for event in completed:
+                event["actions"].append(public_action)
+        else:
+            self.flow.turn_actions.append(public_action)
 
     def recent_log(self, limit: int = 20) -> list[dict[str, Any]]:
         if limit <= 0:
@@ -723,9 +748,11 @@ class GameSession:
             )
 
         revision_before = self.revision
+        checks_before = len(self.public_check_events)
         code = self._dispatch(action_type, params)
         self._touch()
-        self._log(actor, action_type, params, request_id, revision_before, True, detail=code)
+        self._log(actor, action_type, params, request_id, revision_before, True, detail=code,
+                  checks_before=checks_before)
         result = {
             "ok": True,
             "replayed": False,
@@ -807,12 +834,14 @@ class GameSession:
             self.set_message(ui_text.ACTION_UNAVAILABLE_DIALOG)
             return "unavailable"
         revision_before = self.revision
+        checks_before = len(self.public_check_events)
         code = self._dispatch(action_type, dict(params or {}))
         if self.revision == revision_before:
             # A click that succeeded is a state change, so the revision must
             # move for the window exactly as it does for the agent.
             self._touch()
-            self._log(None, action_type, dict(params or {}), None, revision_before, True, detail=code)
+        self._log(None, action_type, dict(params or {}), None, revision_before, True, detail=code,
+                  checks_before=checks_before)
         return code
 
     def click_is_allowed(self, action_type: str) -> bool:
@@ -966,8 +995,23 @@ class GameSession:
         self.interaction.selected_pos = tuple(position)
         self.flow.phase = PHASE_SELECT_TARGET
         self.flow.pending_action = ACTION_MOVE
-        self.set_message(ui_text.selected_piece(piece.kind))
+        self.refresh_selection_message()
         return "selected"
+
+    def refresh_selection_message(self):
+        if self.flow.phase != PHASE_SELECT_TARGET or self.interaction.selected_pos is None:
+            return
+        game = self._require_game()
+        position = tuple(self.interaction.selected_pos)
+        piece = game.get_piece(position)
+        if piece is None:
+            return
+        ability = {"uproot_tree": "uproot the tree", "plant_tree": "plant the tree"}.get(tree_action(game, position))
+        if can_start_extra_turn(game, position):
+            ability = "activate the butterfly's extra-turn ability"
+        self.set_message(ui_text.selected_piece(
+            piece.kind, bool(get_legal_moves_for_piece(game, self.players, position)),
+            self.can_sell_special(position, piece.kind), ability))
 
     def _do_move(self, params: dict[str, Any]) -> str:
         start = self._position(params, "from")
@@ -1318,6 +1362,8 @@ class GameSession:
         piece = game.get_piece(position) if game.is_inside_board(position) else None
         if piece is None:
             return None
+        if self.flow.temp_new_pieces is None:
+            self.flow.temp_new_pieces = [tuple(pos) for pos in game.new_piece]
         self.flow.temp_removed.append((tuple(position), piece))
         game.remove_piece(position)
         self._remove_new_piece_mark(position)
@@ -1340,6 +1386,9 @@ class GameSession:
         for position, piece in reversed(self.flow.temp_removed):
             if game.is_inside_board(position) and game.get_piece(position) is None:
                 game.place_piece(position, piece)
+        if self.flow.temp_new_pieces is not None:
+            game.new_piece = list(self.flow.temp_new_pieces)
+        self.flow.temp_new_pieces = None
         self.flow.temp_removed = []
         self.flow.temp_placed = []
         self.flow.pending_refund_owner = None
@@ -1350,6 +1399,7 @@ class GameSession:
     def _commit_temporary_transaction(self) -> None:
         self.flow.temp_removed = []
         self.flow.temp_placed = []
+        self.flow.temp_new_pieces = None
 
     def _remove_new_piece_mark(self, position: Position) -> None:
         game = self.game
@@ -1395,6 +1445,20 @@ class GameSession:
         results = self.flow.last_condition_results or []
         self.condition_reveal_count = len(results)
         self.condition_results = results
+        game = self._require_game()
+        event = {
+            "turn_number": self.turn_number, "checked_player": game.current_player,
+            "gamemode": game.gamemode, "conditions": list(results),
+            "time_token_owner": game.time_token_owner,
+            "start_board": self.flow.turn_start_board,
+            "end_board": serialize_board(game.board_matrix),
+            "trigger": self.flow.checking_action_message,
+            "actions": list(self.flow.turn_actions),
+        }
+        self.flow.last_public_check = event
+        self.flow.public_check_archive.append(event)
+        self.public_check_events.append(event)
+        self.flow.turn_actions = []
         self.resolve_turn_end(self.flow.checking_action_message)
 
     def normalize_after_load(self) -> None:
@@ -1437,7 +1501,7 @@ class GameSession:
                 winner = game.current_player
                 game.current_ap = 0
                 self.end_session("check_victory", other_player(winner))
-                self.set_message(f"{winner.capitalize()} wins. {ui_text.NEW_GAME_PLUS_HINT}")
+                self.set_message(f"{winner.capitalize()} wins. Game 1 is over.")
                 return
             self.flow.phase = PHASE_TIME_WISH
             self.flow.time_wish_winner = game.current_player
@@ -1446,11 +1510,7 @@ class GameSession:
                 game.current_player = token_owner
             game.max_ap = 1
             game.current_ap = 1
-            owner_label = token_owner.capitalize() if token_owner in {"black", "white"} else "Time token holder"
-            self.set_message(
-                f"{self.flow.time_wish_winner.capitalize()} wins, but is this truly the end? "
-                f"{owner_label}, spend the time token and make your wish."
-            )
+            self.set_message(ui_text.time_wish_prompt(self.flow.time_wish_winner, token_owner))
             return
         if game.gamemode == 3 and game.g3_turn.pending_extra_turn and game.current_ap > 0:
             game.new_piece = []
@@ -1465,12 +1525,15 @@ class GameSession:
         self.flow.phase = PHASE_PLAYING
         self.flow.pending_action = None
         self.turn_number += 1
+        self.flow.turn_start_board = serialize_board(game.board_matrix)
         self.set_message(f"{action_message} {turn_message}" if action_message else turn_message)
         self._check_mate_if_stuck()
 
     def _check_mate_if_stuck(self) -> bool:
         game = self.game
         if game is None or game.current_ap <= 0 or game.time_token_owner is not None:
+            return False
+        if self._sellable_specials():
             return False
         empty_interaction = Interaction()
         if get_legal_board_targets(game, self.players, empty_interaction):
@@ -1487,8 +1550,7 @@ class GameSession:
         self.game_over_reason = "mate"
         self.finished = True
         self.set_message(
-            f"{game.current_player.capitalize()} has no legal actions. {winner.capitalize()} wins by mate. "
-            f"{ui_text.NEW_GAME_PLUS_HINT}"
+            f"{game.current_player.capitalize()} has no legal actions. {winner.capitalize()} wins by mate."
         )
         return True
 
@@ -1573,15 +1635,7 @@ class GameSession:
         ``can_select_resource`` also accepts a special piece when it could be
         *bought*, so it must not be used to decide what can be sold.
         """
-        game = self.game
-        if game is None or kind not in MODE_SPECIALS[game.gamemode]:
-            return False
-        if game.current_ap < 1:
-            return False
-        piece = game.get_piece(position) if game.is_inside_board(position) else None
-        if piece is None or piece.owner != game.current_player or piece.kind != kind:
-            return False
-        return len(get_empty_accessible_cells(game)) + 1 >= SELL_REFUND[kind]
+        return can_sell_special(self.game, position, kind)
 
     def end_session(self, reason: str = "ended_by_caller", loser: str | None = None) -> dict[str, Any]:
         """Close the session without touching the board."""
