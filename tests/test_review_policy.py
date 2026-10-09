@@ -13,6 +13,7 @@ class ReviewPolicyTests(unittest.TestCase):
     setUp = workflows.WorkflowTests.setUp
     check_turn = workflows.WorkflowTests.check_turn
     reply = workflows.WorkflowTests.reply
+    move = workflows.WorkflowTests.move
 
     def test_action_request_cannot_write_condition_notes(self):
         self.play.next()
@@ -118,9 +119,12 @@ class ReviewPolicyTests(unittest.TestCase):
         self.reply(("get_notes", {}))
         for _ in range(3):
             self.play.tick()
-        self.assertEqual(len(self.requests), 1)
-        self.play.next()
         self.assertEqual(len(self.requests), 2)
+        self.reply(self.move())
+        for _ in range(3):
+            self.play.tick()
+        self.assertEqual(len(self.requests), 2)
+        self.assertIsNone(self.play.step_permit)
 
     def test_step_human_turn_reviews_automatically_then_waits_for_next(self):
         self.app.gui.player_types["black"] = "human"
@@ -215,7 +219,9 @@ class ReviewPolicyTests(unittest.TestCase):
         with patch("agent_play.time.monotonic", return_value=1000):
             self.play.tick()
         self.assertEqual(len(self.requests), 1)
-        self.assertEqual(self.play.state, "ready")
+        self.assertEqual(self.play.state, "stopped")
+        self.assertIn("mode changed", self.play.message)
+        self.assertIsNone(self.play.step_permit)
         self.assertFalse(self.play.continuation)
         self.play.next()
         self.assertEqual(len(self.requests), 2)
@@ -227,6 +233,7 @@ class ReviewPolicyTests(unittest.TestCase):
         self.assertNotIn("update_notes", self.play.allowed_tools)
         self.reply(("get_notes", {}))
         self.check_turn()
+        self.play.tick()  # The external turn change revokes the unfinished decision.
         self.notes.tick()
         self.assertEqual(self.requests[-1].payload["messages"][0]["content"], "复盘中文")
         self.assertEqual([t["function"]["name"] for t in self.requests[-1].payload["tools"]], ["update_notes"])

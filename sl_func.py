@@ -17,11 +17,12 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
+from app_paths import application_dir
 from basicgame import Chessboard, Interaction, Playerstate, Resource, SPECIAL_KINDS
 from game2 import G2_CORNER_LAYOUT
 
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = application_dir()
 SAVES_DIR = BASE_DIR / "saves"
 SAVE_VERSION = 1
 # How many post-wish continuation saves to keep per directory.

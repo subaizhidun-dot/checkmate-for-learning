@@ -36,6 +36,82 @@ class HumanControlsTests(unittest.TestCase):
         self.app.gui.draw(self.app.state, legal_board_targets=board,
                           legal_resource_targets=resources, legal_camp_targets=camps, mouse_pos=(-1, -1))
 
+    def prepare_sized_army(self, mode=3, count=7, holder="black"):
+        from test_transaction_legality import sized_army
+        self.start(mode)
+        session = self.app.state.session
+        fixture = sized_army(mode, count, holder)
+        session.game.board_matrix = fixture.game.board_matrix
+        session.game.time_token_owner = holder
+        session.game.new_piece = []
+        session.game.max_ap = fixture.game.max_ap
+        session.refresh_players()
+        session.set_message(f"Black to move. {holder.capitalize()} holds the time token.")
+        self.app.after_engine_change()
+        return session
+
+    def capture_limit(self, name):
+        directory = os.environ.get("CHECKMATE_GUI_CAPTURE_DIR")
+        if directory:
+            import pygame
+            Path(directory).mkdir(parents=True, exist_ok=True)
+            pygame.image.save(self.app.gui.window, str(Path(directory) / (name + ".png")))
+
+    def test_token_transfer_hint_and_removal_targets_for_eight_piece_recipient(self):
+        import gui
+        for mode in (1, 2, 3):
+            with self.subTest(mode=mode):
+                session = self.prepare_sized_army(mode, count=8, holder="white")
+                self.assertEqual(self.app.get_legal_targets()[2], {"black"})
+                self.render()
+                panel = gui.LEFT_CAMP_RECT
+                pixel = (panel.x + gui.LEGAL_HINT_INSET, panel.y + gui.LEGAL_HINT_INSET)
+                self.assertEqual(tuple(self.app.gui.screen.get_at(pixel))[:3], gui.LEGAL_HINT_COLOR)
+                self.capture_limit(f"g{mode}-token-transfer-legal")
+                self.assertEqual(session.select_camp("black"), "token_moved")
+                self.app.after_engine_change()
+                self.assertEqual(session.flow.phase, "pending_piece_limit")
+                targets, resources, camps = self.app.get_legal_targets()
+                self.assertEqual(len(targets), 8)
+                self.assertEqual(resources, set())
+                self.assertEqual(camps, set())
+                self.render()
+                for target in targets:
+                    rect = self.app.gui.rect_for_logical_cell(*target)
+                    pixel = (rect.x + gui.LEGAL_HINT_INSET, rect.y + gui.LEGAL_HINT_INSET)
+                    self.assertEqual(tuple(self.app.gui.screen.get_at(pixel))[:3], gui.LEGAL_HINT_COLOR)
+
+    def test_free_elephant_bonus_renders_required_removal_for_human_and_llm(self):
+        import gui
+        session = self.prepare_sized_army()
+        session.select_board((2, 3))
+        session.select_board((3, 3))
+        self.assertEqual(session.flow.phase, "pending_elephant_bonus")
+        session.select_board((2, 3))
+        self.app.after_engine_change()
+        self.assertEqual(session.flow.phase, "pending_piece_limit")
+        self.assertIn("Remove pieces", session.pending_message)
+        targets = self.app.get_legal_targets()[0]
+        self.assertEqual(len(targets), 8)
+        self.assertNotIn((6, 1), targets)
+        for llm in (False, True):
+            self.app.gui.agent_play_mode = llm
+            self.app.gui.player_types["black"] = "llm" if llm else "human"
+            self.app.apply_settings()
+            self.assertEqual(self.app.get_legal_targets()[0], targets)
+            self.render()
+            color = gui.LLM_LEGAL_HINT_COLOR if llm else gui.LEGAL_HINT_COLOR
+            for target in targets:
+                rect = self.app.gui.rect_for_logical_cell(*target)
+                self.assertEqual(tuple(self.app.gui.screen.get_at((rect.x + gui.LEGAL_HINT_INSET,
+                                                                  rect.y + gui.LEGAL_HINT_INSET)))[:3], color)
+            self.capture_limit("elephant-bonus-removal-" + ("llm" if llm else "human"))
+        session.select_board((2, 3))
+        self.app.after_engine_change()
+        self.assertEqual(session.players["black"].num_pieces, 7)
+        self.assertEqual(session.game.current_ap, 2)
+        self.assertEqual(session.flow.phase, "playing")
+
     def test_all_modes_share_five_button_positions_and_question_mark_is_not_clickable(self):
         expected = [tuple(self.app.gui.resource_button_rect(index)) for index in range(5)]
         for mode in (1, 2, 3, 1):

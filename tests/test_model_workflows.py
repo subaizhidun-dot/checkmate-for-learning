@@ -60,6 +60,214 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.session.game.current_ap, 1)
         self.assertEqual(self.play.state, "ready")
 
+    def test_step_intent_only_preserves_board_and_continues_the_authorized_decision(self):
+        before = self.session.snapshot()
+        self.app.gui.prompts = {"system_prompt": "本地中文：先记录计划，再行动。"}
+        self.play.next()
+        payload = self.requests[-1].payload
+        self.assertEqual(payload["messages"][0]["content"], self.app.gui.prompts["system_prompt"])
+        self.assertIn("record_intent", json.loads(payload["messages"][1]["content"])["execution_protocol"])
+        self.reply(("record_intent", {"text": "计划从 (2,1) 移动到 (3,1)，条件预测未验证。"}))
+        for _ in range(20):
+            self.notes.tick()
+            self.play.tick()
+        after = self.session.snapshot()
+        for key in ("board", "revision", "current_ap", "phase"):
+            self.assertEqual(after[key], before[key])
+        self.assertEqual(len(self.requests), 2)
+        self.assertTrue(any("Continuing this decision" in str(output) for output in self.app.outputs))
+        self.reply(self.move())
+        for _ in range(10):
+            self.play.tick()
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.play.state, "ready")
+
+    def test_intent_then_move_runs_in_order_with_actual_receipts(self):
+        receipts = []
+        self.app.report_tool_receipt = lambda session, identity, text, **kwargs: receipts.append(text)
+        self.play.next()
+        self.requests[-1].response = response(("record_intent", {"text": "中文计划"}), self.move())
+        self.play.tick()
+        self.assertEqual(self.session.game.current_ap, 3)
+        self.assertIn("tools pending: record_intent → move_piece", receipts[-1])
+        self.play.tick()
+        self.assertEqual(self.session.game.current_ap, 3)
+        self.assertIn("record_intent | Succeeded", receipts[-1])
+        self.assertIsNotNone(self.session.game.get_piece((2, 1)))
+        self.play.tick()
+        self.assertEqual(self.session.game.current_ap, 2)
+        self.assertIsNotNone(self.session.game.get_piece((3, 1)))
+        self.assertIn("move_piece | Succeeded | AP 3 → 2", receipts[-2])
+        self.assertEqual(len(self.requests), 1)
+
+    def test_queued_review_waits_for_entire_reply_and_step_stays_manual(self):
+        self.check_turn()
+        event = deepcopy(self.session.flow.last_public_check)
+        self.notes.collect()
+        self.notes.queue.clear()
+        self.session.game.current_ap = 3
+        self.play.next()
+        side = self.play.tools.color
+        self.notes.queue.append((self.session, side, event))
+        move = self.play.tools.get_legal_actions()["moves"][0]
+        self.requests[-1].response = response(("record_intent", {"text": "计划"}), ("move_piece", {
+            "source": move["source"], "target": move["target"], "revision": self.session.revision, "request_id": "serial"}))
+        self.notes.tick()
+        self.assertEqual(len(self.requests), 1)
+        self.play.tick()
+        self.play.tick()
+        self.notes.tick()
+        self.assertEqual(len(self.requests), 1)
+        self.play.tick()
+        self.notes.tick()
+        self.assertEqual(len(self.requests), 2)
+        self.play.next()  # Next during review cannot queue a Step action.
+        self.requests[-1].response = response(("update_notes", {"text": "复盘笔记"}))
+        self.notes.tick()
+        for _ in range(10):
+            self.play.tick()
+            self.notes.tick()
+        self.assertEqual(len(self.requests), 2)
+        self.play.next()
+        self.assertEqual(len(self.requests), 3)
+
+    def test_review_waits_through_read_followups_for_the_whole_decision(self):
+        self.check_turn()
+        event = deepcopy(self.session.flow.last_public_check)
+        self.notes.collect()
+        self.notes.queue.clear()
+        self.session.game.current_ap = 3
+        self.play.next()
+        side = self.play.tools.color
+        self.notes.queue.append((self.session, side, event))
+        for name, args in (("get_legal_actions", {}), ("record_intent", {"text": "Check then move"})):
+            self.reply((name, args))
+            self.assertIsNone(self.play.request)
+            self.notes.tick()  # A gap between requests cannot start a queued review.
+            self.assertIsNone(self.notes.active)
+            self.play.tick()
+            self.assertIsNotNone(self.play.request)
+        move = self.play.tools.get_legal_actions()["moves"][0]
+        self.reply(("move_piece", {"source": move["source"], "target": move["target"],
+                                  "revision": self.session.revision, "request_id": "finish-decision"}))
+        self.notes.tick()
+        self.assertIsNone(self.play.request)
+        self.assertIsNotNone(self.notes.active)
+        self.assertEqual(len(self.requests), 4)
+        self.requests[-1].response = response(("update_notes", {"text": "Reviewed evidence"}))
+        self.notes.tick()
+        self.play.tick()
+        self.assertEqual(len(self.requests), 4)
+        self.assertIsNone(self.play.step_permit)
+
+    def test_authorization_is_cleared_in_gaps_and_never_crosses_state_changes(self):
+        for change in ("pause", "stop", "step_to_auto", "auto_to_step", "board", "turn", "new_game", "player"):
+            with self.subTest(change=change):
+                self.setUp()
+                if change == "auto_to_step":
+                    self.app.gui.play_control_mode = "auto"
+                self.play.next()
+                self.reply(("get_notes", {}))
+                self.assertTrue(self.play.continuation)
+                if change in {"pause", "stop"}:
+                    getattr(self.play, change)()
+                elif change == "board":
+                    self.session._touch()
+                elif change == "turn":
+                    self.session.turn_number += 2
+                elif change == "new_game":
+                    self.app.state.session = GameSession.new_game(3)
+                elif change == "player":
+                    self.app.gui.player_types["black"] = "human"
+                else:
+                    self.app.gui.play_control_mode = "step" if change == "auto_to_step" else "auto"
+                self.play.tick()
+                self.app.gui.player_types["black"] = "llm"
+                for _ in range(4):
+                    self.play.tick()
+                self.assertEqual(len(self.requests), 1)
+                self.assertIsNone(self.play.step_permit)
+                self.assertFalse(self.play.decision_running)
+
+    def test_human_turn_and_switching_the_opponent_to_llm_grant_no_step_action(self):
+        self.app.gui.player_types = {"black": "human", "white": "human"}
+        self.check_turn()
+        for _ in range(4):
+            self.play.tick()
+            self.notes.tick()
+        self.assertEqual(self.requests, [])
+        self.app.gui.player_types["white"] = "llm"
+        for _ in range(4):
+            self.play.tick()
+        self.assertEqual(self.requests, [])
+        self.assertIsNone(self.play.step_permit)
+
+    def test_no_tool_calls_stop_step_with_a_reason_and_clear_authorization(self):
+        self.play.next()
+        self.reply()
+        for _ in range(4):
+            self.play.tick()
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn("No valid tool calls", self.play.message)
+        self.assertIsNone(self.play.step_permit)
+
+    def test_screenshot_plan_format_rejection_and_corrected_ordered_plan(self):
+        from basicgame import Resource
+        self.session.game.board_matrix = [[None for _ in range(9)] for _ in range(7)]
+        for side, kind, cells in (("black", "squirrel", [(2, 1), (2, 2), (2, 5)]),
+                                  ("black", "elephant", [(2, 3)]),
+                                  ("white", "squirrel", [(4, 3), (5, 3), (6, 3)]),
+                                  ("white", "elephant", [(6, 4)]),
+                                  ("white", "butterfly", [(6, 5)])):
+            for cell in cells:
+                self.session.game.set_piece(cell, Resource(side, kind))
+        self.session.refresh_players()
+        self.session.game.current_ap = self.session.game.max_ap = 5
+        self.session.game.time_token_owner = "white"
+        self.session.revision, self.session.turn_number = 24, 5
+        tools = self.app.agent_tools_by_side["black"]
+        actions = [{"type": "apply_action", "params": {"action_id": "place_squirrel:at=3,2"}},
+                   {"type": "move_piece", "params": {"source": [2, 5], "target": [2, 4]}},
+                   {"type": "move_piece", "params": {"source": [2, 4], "target": [3, 4]}}]
+        before = self.session.snapshot()
+        result = tools.submit_plan(actions, 24, "t5-b7f3a1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "illegal_action")
+        self.assertEqual(result["executed"], [])
+        self.assertEqual(result["rejected_step"]["index"], 1)
+        self.assertEqual(result["rejected_step"]["action"], actions[0])
+        self.assertIn("place_squirrel:at=3,2", result["rejected_step"]["legal_action_ids"])
+        self.assertIn("tool name, not a game action type", result["message"])
+        for key in ("board", "revision", "current_ap", "phase"):
+            self.assertEqual(self.session.snapshot()[key], before[key])
+        self.assertTrue(tools.submit_plan(actions, 24, "t5-b7f3a1")["replayed"])
+        corrected = [{"type": "place_squirrel", "params": {"at": [3, 2]}},
+                     {"type": "select_piece", "params": {"at": [2, 5]}},
+                     {"type": "move", "params": {"from": [2, 5], "to": [2, 4]}},
+                     {"type": "select_piece", "params": {"at": [2, 4]}},
+                     {"type": "move", "params": {"from": [2, 4], "to": [3, 4]}}]
+        self.play.next()
+        self.reply(("record_intent", {"text": "Place then move twice"}),
+                   ("submit_plan", {"actions": corrected, "revision": 24, "request_id": "corrected"}))
+        self.assertEqual(self.session.revision, 29)
+        self.assertEqual(self.session.turn_number, 6)
+        self.assertEqual(self.session.game.current_player, "white")
+        self.assertIsNotNone(self.session.game.get_piece((3, 4)))
+        for _ in range(4):
+            self.play.tick()
+        self.assertEqual(len(self.requests), 1)
+
+    def test_program_generated_strings_use_english_and_preserve_raw_model_text(self):
+        import ast
+        import re
+        for filename in ("agent_play.py", "agent_prompts.py", "agenttools.py", "gui.py", "main.py", "note_review.py"):
+            tree = ast.parse(Path(filename).read_text(encoding="utf-8"))
+            strings = [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+            self.assertFalse(any(re.search(r"[\u3400-\u9fff]", value) for value in strings), filename)
+        self.play.next()
+        self.reply(("record_intent", {"text": "中文计划\nEnglish second line"}))
+        self.assertEqual(self.session.flow.agent_intents["black"][-1]["text"], "中文计划\nEnglish second line")
+
     def test_illegal_suffix_preserves_prefix_and_discards_later_calls(self):
         self.play.next()
         self.reply(self.move(), self.move((3, 1), (99, 99), "illegal"),
@@ -89,7 +297,6 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.play.state, "ready")
 
     def test_no_ap_deadline_survives_read_queries_and_stream_output(self):
-        self.app.gui.play_control_mode = "auto"
         with patch("agent_play.time.monotonic", return_value=100):
             self.play.next()
             self.reply(("get_notes", {}))
@@ -106,14 +313,19 @@ class WorkflowTests(unittest.TestCase):
         with patch("agent_play.time.monotonic", return_value=100):
             self.play.next()
         with patch("agent_play.time.monotonic", return_value=150):
-            self.reply(("apply_action", {"action_id": "select_piece:at=2,1", "revision": self.session.revision}))
+            self.reply(("apply_action", {"action_id": "select_piece:at=2,3", "revision": self.session.revision}))
             self.assertEqual(self.play.no_ap_since, 100)
-            self.play.next()
+            self.play.tick()
         with patch("agent_play.time.monotonic", return_value=180):
-            self.reply(("apply_action", {"action_id": "move:from=2,1;to=3,1", "revision": self.session.revision}))
+            self.reply(("apply_action", {"action_id": "move:from=2,3;to=3,3", "revision": self.session.revision}))
             self.assertEqual(self.play.no_ap_since, 180)
+            self.assertEqual(self.session.flow.phase, "pending_elephant_bonus")
+            self.play.tick()
+        with patch("agent_play.time.monotonic", return_value=190):
+            self.reply(("apply_action", {"action_id": "skip_elephant_bonus", "revision": self.session.revision}))
         with patch("agent_play.time.monotonic", return_value=900):
             self.play.tick()
+        self.assertIsNone(self.play.no_ap_since)
         self.assertEqual(self.play.state, "ready")
 
     def test_checks_publish_after_animation_and_include_finishing_action(self):

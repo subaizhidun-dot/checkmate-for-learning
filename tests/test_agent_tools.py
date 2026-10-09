@@ -204,6 +204,8 @@ class AgentToolTests(unittest.TestCase):
             {"type": "move", "params": {"from": [3, 1], "to": [8, 6]}},
         ]}
         result = tools.call("submit_plan", args)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "illegal_action")
         self.assertEqual(len(result["executed"]), 2)
         self.assertEqual(result["stop_reason"], "illegal_action")
         self.assertNotIn("state", result)
@@ -217,6 +219,19 @@ class AgentToolTests(unittest.TestCase):
         self.assertEqual(session.snapshot(), after)
         args["actions"].pop()
         self.assertEqual(tools.call("submit_plan", args)["code"], "request_conflict")
+
+    def test_plan_rejected_first_step_is_failure_without_board_or_ap_change(self):
+        session = playing()
+        tools = AgentTools(session, "black")
+        before = session.snapshot()
+        result = tools.call("submit_plan", {"revision": session.revision, "request_id": "rejected-plan",
+                            "actions": [{"type": "move", "params": {"from": [2, 1], "to": [99, 99]}}]})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["executed"], [])
+        self.assertEqual(result["stop_reason"], "illegal_action")
+        after = session.snapshot()
+        for key in ("board", "current_ap", "revision", "phase"):
+            self.assertEqual(after[key], before[key])
 
     def test_action_retry_has_only_public_current_state(self):
         session = playing()

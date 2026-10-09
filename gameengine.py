@@ -478,7 +478,8 @@ class GameSession:
             return False
         if game.current_ap < 1:
             return False
-        return not any(player.num_pieces > 7 for player in self.players.values())
+        # A single transfer completes by resolving the recipient's piece limit.
+        return True
 
     # ------------------------------------------------------------------
     # Legal actions (dynamic whitelist, recomputed from the board)
@@ -1290,6 +1291,7 @@ class GameSession:
             self.set_message(ui_text.PIECE_LIMIT_TARGET_DIALOG)
             return "illegal_target"
         game.remove_piece(position)
+        self._remove_new_piece_mark(position)
         self.refresh_players()
         owner_state = self.players.get(owner)
         if owner_state is not None and owner_state.num_pieces <= 7:
@@ -1314,7 +1316,7 @@ class GameSession:
         self.flow.pending_action = ACTION_MOVE_TIME_TOKEN
         game.set_time_token_owner(other_player(game.time_token_owner))
         game.spend_ap(1)
-        self._enter_piece_limit_or_finish(ui_text.TOKEN_MOVED_ONCE_DIALOG)
+        self._finish_action(ui_text.TOKEN_MOVED_ONCE_DIALOG)
         return "token_moved"
 
     def _do_fast_time_token(self, params: dict[str, Any]) -> str:
@@ -1413,6 +1415,13 @@ class GameSession:
     def _finish_action(self, action_message: str) -> None:
         game = self._require_game()
         self._clear_selection()
+        holder = game.time_token_owner
+        holder_state = self.players.get(holder) if holder is not None else None
+        if holder_state is not None and holder_state.num_pieces > 7:
+            self.flow.phase = PHASE_PENDING_PIECE_LIMIT
+            self.flow.pending_piece_limit_owner = holder
+            self.set_message(ui_text.PIECE_LIMIT_DIALOG)
+            return
         if game.current_ap > 0:
             if self._check_mate_if_stuck():
                 return
@@ -1553,17 +1562,6 @@ class GameSession:
             f"{game.current_player.capitalize()} has no legal actions. {winner.capitalize()} wins by mate."
         )
         return True
-
-    def _enter_piece_limit_or_finish(self, message: str) -> None:
-        game = self._require_game()
-        holder = game.time_token_owner
-        holder_state = self.players.get(holder) if holder is not None else None
-        if holder_state is not None and holder_state.num_pieces > 7:
-            self.flow.phase = PHASE_PENDING_PIECE_LIMIT
-            self.flow.pending_piece_limit_owner = holder
-            self.set_message(ui_text.PIECE_LIMIT_DIALOG)
-            return
-        self._finish_action(message)
 
     def cancel_current_action(self) -> str:
         if self.is_over():

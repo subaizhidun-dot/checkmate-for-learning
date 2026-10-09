@@ -47,7 +47,7 @@ class AgentTools:
                 return {"ok": False, "code": "stale_game", "message": "This game has been replaced."}
             result = getattr(self, name)(**(arguments or {}))
         except EngineError as error:
-            result = {"ok": False, "code": error.code, "message": "Action rejected. Refresh the current state and legal actions."}
+            result = {"ok": False, "code": error.code, "message": error.message, "details": deepcopy(error.details)}
         except (TypeError, ValueError, KeyError):
             result = {"ok": False, "code": "invalid_argument", "message": "Invalid tool arguments."}
         except Exception:
@@ -248,13 +248,26 @@ class AgentTools:
             ids.append(encode_action_id(action["type"], action.get("params", {})))
         executed = []
         stop_reason = "completed"
-        for action_id in ids:
+        failure = None
+        for index, action_id in enumerate(ids):
             if not self._can_decide():
                 stop_reason = "awaiting_other_side"
                 break
             result = self.call("apply_action", {"action_id": action_id, "revision": self.session.revision})
             if not result["ok"]:
                 stop_reason = result["code"]
+                failure = result
+                legal = self.get_legal_actions()
+                rejected_step = {"index": index + 1, "action": deepcopy(actions[index]), "action_id": action_id,
+                                 "revision": self.session.revision, "phase": self.session.flow.phase,
+                                 "actor": self.session.actor(),
+                                 "legal_action_ids": [action["action_id"] for action in legal["actions"]],
+                                 "legal_moves": legal["moves"]}
+                if actions[index]["type"] in TOOLS:
+                    failure = {**failure, "message": (
+                        f"'{actions[index]['type']}' is a tool name, not a game action type. "
+                        "Plan entries must use game action types and params from get_legal_actions.actions; "
+                        "for example place_squirrel with at, or select_piece with at followed by move with from/to.")}
                 break
             executed.append(action_id)
             if self.session.flow.phase in {"checking_win", "time_wish", "game_over"}:
@@ -266,8 +279,11 @@ class AgentTools:
             if self.session.actor() != self.color:
                 stop_reason = "awaiting_other_side"
                 break
-        payload = self._action_result({"ok": True, "replayed": False, "executed": executed,
+        payload = self._action_result({"ok": failure is None, "replayed": False, "executed": executed,
                                        "stop_reason": stop_reason}, revision)
+        if failure is not None:
+            payload.update(code=failure["code"], message=failure.get("message", "Planned action rejected."),
+                           rejected_step=rejected_step)
         self._plans[request_id] = (signature, deepcopy(payload))
         if len(self._plans) > 128:
             self._plans.pop(next(iter(self._plans)))

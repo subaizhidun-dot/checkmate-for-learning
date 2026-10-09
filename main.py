@@ -28,7 +28,7 @@ from llm_usage import LLMUsage
 from local_settings import LocalSettings, default_profile
 from settings_widgets import NUMERIC_SETTINGS, read_clipboard, write_clipboard
 from agent_play import AgentPlayController, ConnectionTester
-from agent_prompts import SYSTEM_PROMPT, NOTES_PROMPT, NG_PLUS_PROMPT
+from agent_prompts import SYSTEM_PROMPT, NOTES_PROMPT, NG_PLUS_PROMPT, DEFAULT_PROMPTS
 from note_review import NoteReviewer
 from gameengine import (
     GameSession,
@@ -170,6 +170,8 @@ class CheckMateApp:
                     running = False
                     break
                 if self.handle_setting_event(event):
+                    continue
+                if self.gui.handle_thinking_selection_event(event):
                     continue
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     self.note_reviewer.cancel()
@@ -351,6 +353,21 @@ class CheckMateApp:
             return True
         if clicked and clicked.startswith("slider:") and gui.active_setting == "field:" + clicked[7:]:
             self.close_setting_editor()
+        if clicked and clicked.startswith("copy_"):
+            try:
+                write_clipboard(gui.prompt_text(clicked.removeprefix("copy_") + "_text"))
+                gui.settings_error = "Prompt copied."
+            except (OSError, pygame.error, UnicodeError):
+                gui.settings_error = "Clipboard unavailable; try again."
+            return True
+        if clicked and clicked.startswith("restore_"):
+            name = clicked.removeprefix("restore_")
+            # Discard only this prompt's pending edit; other editors keep their state.
+            if gui.active_setting == name + "_text":
+                self.close_setting_editor()
+            gui.prompts[name] = DEFAULT_PROMPTS[name]
+            self.save_local_settings()
+            return True
         if gui.active_setting and not self.commit_setting():
             return True
         if clicked is None:
@@ -360,12 +377,6 @@ class CheckMateApp:
         elif clicked in {"system_prompt", "notes_prompt", "ng_plus_prompt"}:
             attribute = clicked + "_expanded"
             setattr(gui, attribute, not getattr(gui, attribute))
-        elif clicked in {"copy_system_prompt", "copy_notes_prompt", "copy_ng_plus_prompt"}:
-            try:
-                write_clipboard(gui.prompts[clicked.removeprefix("copy_")])
-                gui.settings_error = "Prompt copied."
-            except (OSError, pygame.error, UnicodeError):
-                gui.settings_error = "Clipboard unavailable; try again."
         elif clicked in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}:
             self.focus_setting(clicked)
             editor.set_cursor(self.setting_cursor_at(self.active_setting_rect(), event.pos))
@@ -439,6 +450,7 @@ class CheckMateApp:
         return self.gui.setting_cursor_at(rect, position[0])
 
     def focus_setting(self, name):
+        self.gui.thinking_selection.focused = self.gui.thinking_selection.dragging = False
         self.gui.active_setting = name
         self.gui.setting_editor.multiline = name in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}
         value = self.setting_value(name)
@@ -610,7 +622,7 @@ class CheckMateApp:
         session = self.state.session
         if session and session.flow.phase == PHASE_CHOOSE_TOKEN:
             self.gui.play_message = "Initial token: human only"
-        elif self.note_reviewer.busy:
+        elif self.note_reviewer.busy and not self.agent_play.decision_running:
             self.gui.play_message = "Notes review paused" if self.agent_play.paused else "Updating condition notes"
             self.gui.play_can_start = self.agent_play.paused
         elif session and session.flow.phase == PHASE_TIME_WISH:
@@ -692,7 +704,9 @@ class CheckMateApp:
         previous = next((message.get("turn") for message in self.gui.exposure_panes["thinking"].messages
                          if message.get("request_id") == request_id), None)
         display_turn = turn or entry.get("turn") or previous or session.turn_number
-        lines = [f"Request {number} | {entry['side'].capitalize()} | {status.capitalize()}"]
+        display_status = ("Reply received" if status == "completed" and entry.get("purpose") != "notes"
+                          else "Condition notes updated" if status == "completed" else status.capitalize())
+        lines = [f"Request {number} | {entry['side'].capitalize()} | {display_status}"]
         lines.append(f"Turn {display_turn}")
         if entry.get("purpose") == "notes":
             lines.append("Condition Notes Review")
@@ -708,6 +722,13 @@ class CheckMateApp:
                                         color=(235, 74, 72) if status in {"failed", "stopped"} else None,
                                         side=entry["side"] if status in {"completed", "receiving"} else None,
                                         request_id=request_id, turn=display_turn)
+
+    def report_tool_receipt(self, session, request_id, text, *, failed=False):
+        if session is not self.state.session:
+            return
+        entry = session.llm_usage.request_info(request_id)
+        self.gui.append_exposure_output(text, color=(235, 74, 72) if failed else None,
+                                        turn=entry.get("turn") or session.turn_number)
 
     def report_agent_notice(self, text):
         session = self.state.session

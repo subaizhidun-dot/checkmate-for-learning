@@ -11,7 +11,7 @@ import uuid
 from copy import deepcopy
 
 from agenttools import TOOLS
-from agent_prompts import SYSTEM_PROMPT, NG_PLUS_PROMPT, configured_prompt
+from agent_prompts import SYSTEM_PROMPT, NG_PLUS_PROMPT, configured_prompt, ACTION_EXECUTION_PROTOCOL
 from agent_context import context_tool_result, decision_summary
 from chat_stream import ChatStream, MAX_RESPONSE_BYTES, read_chat_stream
 from probe_image import image_probe
@@ -41,10 +41,11 @@ def tool_definitions():
                          ["action_id", "revision"], "Execute one legal action at the current revision."),
         "submit_plan": ({"actions": {"type": "array", "minItems": 1, "maxItems": 32,
                                       "items": {"type": "object", "properties": {
-                                          "type": string, "params": {"type": "object"}},
+                                          "type": {"type": "string", "description": "Game action type from get_legal_actions.actions, such as place_squirrel, select_piece or move. Tool names are not action types."},
+                                          "params": {"type": "object", "description": "Parameters for the game action: at for placement/selection; from and to for move."}},
                                           "required": ["type"], "additionalProperties": False}},
                          "revision": integer, "request_id": string},
-                        ["actions", "revision", "request_id"], "Execute ordered actions, stopping at failure or a turn boundary."),
+                        ["actions", "revision", "request_id"], "Execute ordered game actions, stopping at failure or a turn boundary. Use game action types/params from get_legal_actions.actions. Example: select_piece params {at:[2,1]}, then move params {from:[2,1],to:[3,1]}. apply_action and move_piece are separate tools, not plan action types."),
     }
     return [{"type": "function", "function": {"name": name, "description": definitions[name][2],
              "parameters": {"type": "object", "properties": definitions[name][0],
@@ -353,6 +354,15 @@ class AgentPlayController:
         self.execution_revision = None
         self.call_revisions = {}
         self.step_permit = None
+        self.reply_tools = []
+        self.reply_board = None
+        self.decision_revision = None
+        self.control_mode = self.app.gui.play_control_mode
+
+    def release_decision(self):
+        self.step_permit = None
+        self.continuation = self.decision_running = False
+        self.decision_side = self.decision_revision = self.no_ap_since = None
 
     def side_to_play(self):
         session = self.app.state.session
@@ -364,8 +374,10 @@ class AgentPlayController:
         return None
 
     def next(self):
-        if self.request is not None or self.pending:
+        if self.request is not None or self.pending or (self.decision_running and self.continuation):
             return
+        self.release_decision()
+        self.control_mode = self.app.gui.play_control_mode
         self.paused = False
         self.auto_running = self.app.gui.play_control_mode == "auto"
         if self.reviews_busy():
@@ -392,7 +404,6 @@ class AgentPlayController:
         if self.app.gui.play_control_mode == "step":
             if self.step_permit != (session, session.turn_number, side):
                 return
-            self.step_permit = None
         if self.context_session is not session:
             self.history, self.completed_history, self.previous_history = {}, {}, {}
             self.history_turn, self.cached_images = {}, {}
@@ -403,12 +414,14 @@ class AgentPlayController:
             self.decision_requests = 0
             self.operation_committed = session.flow.phase == "pending_elephant_bonus"
             self.no_ap_since = time.monotonic()
+            self.decision_revision = session.revision
         self.continuation = False
         if self.decision_requests >= MAX_DECISION_REQUESTS:
             self.decision_running = self.auto_running = False
             self.state, self.message = "stopped", "Decision request limit reached."
             self.app.report_agent_notice("Decision request limit reached before completing an operation. Review the reply and press Next to continue.")
             self.app.persist()
+            self.release_decision()
             return
         profile = self.app.gui.api_profiles[side]
         self.no_ap_limit = profile["timeout"]
@@ -416,6 +429,7 @@ class AgentPlayController:
             self.state, self.message = "stopped", "Set API URL and model first."
             self.app.report_agent_notice(self.message)
             self.auto_running = False
+            self.release_decision()
             return
         try:
             completion_url(profile["endpoint"])
@@ -423,6 +437,7 @@ class AgentPlayController:
             self.state, self.message = "stopped", str(error)
             self.app.report_agent_notice(self.message)
             self.auto_running = False
+            self.release_decision()
             return
         self.tools = self.app.agent_tools_by_side[side]
         self.app.agent_tools = self.tools
@@ -442,7 +457,8 @@ class AgentPlayController:
         public_rules = self.tools.call("get_gi_rules")
         public_rules["instructions"] = [line for line in public_rules["instructions"]
                                          if "clue images" not in line]
-        rules = {"public_rules": public_rules, "coordinates": public_state.pop("coordinates")}
+        rules = {"public_rules": public_rules, "coordinates": public_state.pop("coordinates"),
+                 "execution_protocol": ACTION_EXECUTION_PROTOCOL}
         public_state.pop("last_completed_check")
         public_state["turn_number"] = session.turn_number
         public_state.pop("visible_condition_feedback", None)
@@ -467,6 +483,8 @@ class AgentPlayController:
         self.revision = self.anchor.revision
         self.exchange, self.images = [], []
         self.reply_failed = False
+        self.reply_tools = []
+        self.reply_board = deepcopy(public_state["board"])
         self.partial_reasoning, self.partial_reply = "", ""
         self.progress_updated_at = 0
         self.progress_dirty = False
@@ -479,6 +497,7 @@ class AgentPlayController:
             self.state, self.message = "stopped", "Could not start the API request."
             self.app.report_agent_notice(self.message)
             self.auto_running = False
+            self.release_decision()
             return
         self.state, self.message = "running", f"Requesting {side.capitalize()} reply"
         self.decision_requests += 1
@@ -491,9 +510,11 @@ class AgentPlayController:
         self.paused = True
         self.state = "pausing" if self.request is not None or self.pending else "stopped"
         self.message = "Finishing current reply" if self.state == "pausing" else "Paused"
+        if self.request is None and not self.pending:
+            self.release_decision()
 
     def stop(self, *, reset=False):
-        self.step_permit = None
+        self.release_decision()
         self.auto_running = False
         self.continuation = self.decision_running = False
         self.no_ap_since = None
@@ -515,16 +536,18 @@ class AgentPlayController:
             self.received = False
 
     def tick(self):
-        if (self.request is not None or self.pending) and self.anchor is not self.app.state.session:
+        if (self.request is not None or self.pending or self.decision_running) and self.anchor is not self.app.state.session:
             self.stop(reset=True)
             return
         session = self.app.state.session
+        if self.control_mode != self.app.gui.play_control_mode:
+            self.control_mode = self.app.gui.play_control_mode
+            self.stop()
+            self.message = "Play control mode changed; press Next to start a decision."
+            self.app.report_agent_notice(self.message)
+            return
         if self.app.gui.play_control_mode == "step":
             self.auto_running = False
-            if self.request is None and not self.pending:
-                self.continuation = self.decision_running = False
-                if self.state == "running":
-                    self.state, self.message = "ready", "Press Next to continue"
         if (self.decision_running and self.no_ap_since is not None
                 and (self.request is not None or self.pending or self.continuation)
                 and time.monotonic() - self.no_ap_since >= self.no_ap_limit):
@@ -537,13 +560,22 @@ class AgentPlayController:
                 self.stop()
             self.state, self.message = "stopped", "Time wish: human only"
             self.auto_running = False
+            self.release_decision()
             return
         if session is not None and session.result()["winner"] is not None:
             if self.request is not None or self.pending:
                 self.stop()
             self.state, self.message = "stopped", "Game decided"
             self.auto_running = False
+            self.release_decision()
             return
+        if self.decision_running and session is not None:
+            if (session.revision != self.decision_revision or session.turn_number != self.history_turn.get(self.decision_side)
+                    or self.side_to_play() != self.decision_side):
+                self.stop()
+                self.message = "Decision state changed externally; press Next to start a new decision."
+                self.app.report_agent_notice(self.message)
+                return
         if self.request is not None:
             response = self.request.poll()
             if response is None:
@@ -560,8 +592,7 @@ class AgentPlayController:
             self.execute_one()
         elif self.reviews_busy():
             return
-        elif (self.continuation and self.app.gui.play_control_mode == "auto"
-              and self.side_to_play() == self.decision_side and not self.paused):
+        elif self.continuation and self.decision_running and not self.paused:
             self.dispatch()
         elif self.auto_running and self.app.gui.play_control_mode == "auto" and self.side_to_play() is not None:
             self.dispatch()
@@ -578,7 +609,8 @@ class AgentPlayController:
         reviewer = getattr(self.app, "note_reviewer", None)
         if reviewer is not None:
             reviewer.collect()
-        return reviewer is not None and reviewer.busy
+        return reviewer is not None and (reviewer.active is not None
+                                        or (reviewer.busy and not self.decision_running))
 
     def show_progress(self):
         now = time.monotonic()
@@ -595,6 +627,7 @@ class AgentPlayController:
                                           reply=self.partial_reply + "\n" + response["error"], usage=response.get("usage"))
             self.state, self.message = "stopped", response["error"]
             self.auto_running = False
+            self.release_decision()
             return
         data = response.get("data")
         try:
@@ -633,6 +666,7 @@ class AgentPlayController:
             self.state, self.message = "stopped", "API returned an invalid chat reply."
             self.app.report_agent_notice(self.message)
             self.auto_running = False
+            self.release_decision()
             return
         if choice.get("finish_reason") == "length":
             self.app.complete_llm_request(
@@ -644,6 +678,7 @@ class AgentPlayController:
             self.auto_running = False
             self.state, self.message = "stopped", "Output limit reached; raise token limit."
             self.app.report_agent_notice("Output token limit reached. Increase Output Token Limit in Set, then press Next.")
+            self.release_decision()
             return
         if choice.get("finish_reason") not in {None, "stop", "tool_calls"}:
             self.message = "API did not complete the reply normally; no actions executed."
@@ -652,12 +687,15 @@ class AgentPlayController:
             self.pending = []
             self.auto_running = False
             self.state = "stopped"
+            self.release_decision()
             return
         self.app.complete_llm_request(self.anchor, self.request_id, usage=data.get("usage"),
                                       reasoning=message.get("reasoning_content", ""), reply=reply)
         self.received = True
         self.exchange = [assistant]
         self.pending = list(calls)
+        if self.pending:
+            self.execution_notice("Reply received; tools pending: " + " → ".join(call["function"]["name"] for call in calls))
         self.execution_revision = self.revision
         self.call_revisions = {}
         if self.anchor.revision != self.revision:
@@ -675,10 +713,20 @@ class AgentPlayController:
         self.exchange.append({"role": "tool", "tool_call_id": call["id"],
                               "content": json.dumps(result, ensure_ascii=False)})
 
+    def execution_notice(self, text, *, failed=False):
+        reporter = getattr(self.app, "report_tool_receipt", None)
+        if reporter is not None:
+            reporter(self.anchor, self.request_id, text, failed=failed)
+        else:
+            self.app.report_agent_notice(text)
+
     def discard_pending(self, reason):
+        names = [call["function"]["name"] for call in self.pending]
         for call in self.pending:
             self.tool_result(call, {"ok": False, "code": reason})
         self.pending = []
+        if names:
+            self.execution_notice("Not executed: " + ", ".join(names) + " | stop_reason: " + reason, failed=True)
 
     def execute_one(self):
         if self.anchor.revision != self.execution_revision:
@@ -690,6 +738,7 @@ class AgentPlayController:
             return
         call = self.pending.pop(0)
         before = (self.anchor.game.current_ap, self.anchor.turn_number)
+        revision_before = self.anchor.revision
         try:
             name = call["function"]["name"]
             if name not in self.allowed_tools:
@@ -723,10 +772,29 @@ class AgentPlayController:
                         "url": "data:" + image["mime_type"] + ";base64," + image["data"]}}))
                 result = {"ok": True, "gamemode": result["gamemode"],
                           "images": [{"index": image["index"], "mime_type": image["mime_type"]} for image in result["images"]]}
-        except (ValueError, KeyError, TypeError):
-            result = {"ok": False, "code": "invalid_tool_call"}
+        except (ValueError, KeyError, TypeError) as error:
+            result = {"ok": False, "code": "invalid_tool_call", "message": str(error) or "Invalid tool arguments"}
         self.tool_result(call, result)
+        self.reply_tools.append(name)
+        outcome = "Succeeded" if result.get("ok") else "Failed"
+        if result.get("replayed"):
+            outcome += " (replayed receipt; not executed again)"
+        receipt = (f"{name} | {outcome} | AP {before[0]} → {self.anchor.game.current_ap}"
+                   f" | revision {revision_before} → {self.anchor.revision}")
+        if result.get("executed") is not None:
+            receipt += f" | executed {len(result['executed'])} steps"
+        for key in ("code", "message", "stop_reason"):
+            if result.get(key):
+                receipt += f" | {key}: {result[key]}"
+        if not result.get("ok"):
+            receipt += "\nArguments: " + call["function"]["arguments"]
+        if result.get("rejected_step"):
+            rejected = result["rejected_step"]
+            receipt += (f"\nRejected step {rejected['index']}: " + json.dumps(rejected["action"], ensure_ascii=False)
+                        + f" | action_id: {rejected['action_id']}")
+        self.execution_notice(receipt, failed=not result.get("ok"))
         self.execution_revision = self.anchor.revision
+        self.decision_revision = self.anchor.revision
         if result.get("ok") and not result.get("replayed"):
             spent = self.anchor.game.current_ap < before[0] or self.anchor.turn_number != before[1]
             self.operation_committed |= spent
@@ -736,8 +804,6 @@ class AgentPlayController:
             if name in {"apply_action", "submit_plan"} and self.anchor.flow.phase == "playing":
                 action_ids = result.get("executed", [result.get("action_id", "")])
                 self.operation_committed |= any(action_id.startswith("remove_piece_limit:") for action_id in action_ids)
-        if not result.get("ok"):
-            self.app.report_agent_notice("Tool result | " + json.dumps(result, ensure_ascii=False))
         self.app.refresh_exposure_notes()
         if not result.get("ok") or (name == "submit_plan" and result.get("stop_reason") not in {"completed", None}):
             self.discard_pending("previous_action_stopped")
@@ -776,17 +842,31 @@ class AgentPlayController:
         boundary = (phase in {"checking_win", "time_wish", "game_over"}
                     or not self.tools._can_decide() or self.anchor.turn_number != self.history_turn[self.tools.color])
         completed = boundary or (self.operation_committed and phase == "playing")
+        unchanged = (self.reply_board == self.anchor.snapshot()["board"])
+        if self.reply_failed:
+            summary = "Tool execution failed; decision stopped. Review the receipt and press Next to continue."
+        elif not has_tools:
+            summary = "No valid tool calls; decision stopped. Press Next to continue."
+        elif self.paused:
+            summary = "Current reply processed; paused. Press Next to continue."
+        elif completed:
+            summary = "Decision complete. Press Next for another decision." if winner is None else "Game decided."
+        elif unchanged and all(name.startswith("get_") or name == "record_intent" for name in self.reply_tools):
+            summary = "Read/intent tools completed; board unchanged. Continuing this decision."
+        else:
+            summary = "Intermediate steps completed; continuing this decision."
+        self.execution_notice(summary, failed=self.reply_failed or not has_tools)
         if completed or not has_tools:
             self.archive_decision(self.tools.color)
-        if self.paused or winner is not None or self.reply_failed:
+        if self.paused or winner is not None or self.reply_failed or not has_tools:
             self.state = "stopped"
-            self.message = "Paused" if self.paused else "Game decided" if winner is not None else "Tool failed; review before continuing."
+            self.message = summary
             self.auto_running = False
-        elif has_tools and not completed and self.app.gui.play_control_mode == "auto":
+        elif not completed:
             self.continuation = True
-            self.state, self.message = "running", "Continuing the current operation"
+            self.state, self.message = "running", summary
             return
         else:
-            self.state, self.message = "ready", "Operation finished; next decision ready" if completed else "Reply finished; press Next to continue"
-        self.continuation = self.decision_running = False
+            self.state, self.message = "ready", summary
+        self.release_decision()
         self.app.persist()

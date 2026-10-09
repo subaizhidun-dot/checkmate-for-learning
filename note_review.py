@@ -71,7 +71,7 @@ class NoteReviewer:
                 return
             self.finish(returned)
         if (self.queue and not self.app.agent_play.paused and self.app.agent_play.request is None
-                and not self.app.agent_play.pending):
+                and not self.app.agent_play.pending and not self.app.agent_play.decision_running):
             self.start(*self.queue.popleft())
 
     def start(self, session, side, event):
@@ -153,7 +153,7 @@ class NoteReviewer:
                 result = job["tools"].call("update_notes", arguments)
                 if not result.get("ok"):
                     raise ValueError("The notes binding is no longer active")
-                reply += "\nUpdated notes\n" + arguments["text"]
+                reply += "\nupdate_notes | Succeeded; condition notes updated; board unchanged\n" + arguments["text"]
             except (KeyError, TypeError, IndexError, ValueError, AttributeError) as exc:
                 error = "Notes review failed: " + str(exc)
         event = job["event"]
