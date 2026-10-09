@@ -282,6 +282,6 @@ To distribute the runnable source, include the 22 root-level Python modules, `pi
 
 ## AI assistance
 
-The original project declaration is consolidated here: GPT-5.5, developed by OpenAI and used through Codex, assisted with implementation discussions, data storage, project structure, framework setup, translation of comments and visible interface text from Chinese into English, complex functions and code-level testing. The project author takes responsibility for the submitted work.
+The original project declaration is consolidated here: GPT-6.1 Sol, GPT-6 Astra, developed by OpenAI and used through Codex, assisted with implementation discussions, data storage, project structure, framework setup, translation of comments and visible interface text from Chinese into English, complex functions and code-level testing. The project author takes responsibility for the submitted work.
 
 Further development has used AI assistance through Codex for code changes, documentation and verification. Updated pixel-art assets and rule diagrams were generated or edited with OpenAI image-generation tools. This remains a learning project and should be reviewed against the intended game rules when extended.
