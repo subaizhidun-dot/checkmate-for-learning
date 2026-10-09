@@ -12,8 +12,8 @@ import pygame
 from basicgame import is_player_accessible
 from game2 import SHIFTED_CORNERS
 from local_settings import default_profile
-from settings_widgets import LineEditor, NUMERIC_SETTINGS
-from agent_prompts import SYSTEM_PROMPT
+from settings_widgets import LineEditor, NUMERIC_SETTINGS, read_clipboard
+from agent_prompts import SYSTEM_PROMPT, NOTES_PROMPT, NG_PLUS_PROMPT, DEFAULT_PROMPTS
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -66,6 +66,7 @@ LEFT_STATUS_RECT = pygame.Rect(64, BOARD_Y + CELL * 3 + 20, CELL * 2, 128)
 RIGHT_STATUS_RECT = pygame.Rect(WINDOW_W - 64 - CELL * 2, BOARD_Y + CELL * 3 + 20, CELL * 2, 128)
 
 LEGAL_HINT_COLOR = (58, 220, 82)
+LLM_LEGAL_HINT_COLOR = (65, 160, 255)
 LEGAL_HINT_WIDTH = 5
 LEGAL_HINT_INSET = 3
 LEGAL_HINT_ARM = 20
@@ -120,7 +121,21 @@ class CheckMateGui:
         }
         self.exposure_line_cache = {}
         self.chat_layout_cache = None
+        self.thinking_turn = None
+        self.notes_side = "black"
+        self.notes_by_side = {}
+        self.notes_summary = ""
+        self.notes_scroll_positions = {}
+        self.notes_page_initialized = False
+        self.thinking_follow_latest = True
+        self.thinking_scroll_positions = {}
+        self.thinking_turn_editor = LineEditor()
+        self.thinking_turn_editing = False
+        self.thinking_turn_invalid = False
+        self.drag_scrollbar = None
+        self.scrollbar_drag_offset = 0
         self.agent_play_mode = False
+        self.legal_hint_color = LEGAL_HINT_COLOR
         self.llm_color = "white"
         self.play_control_mode = "step"
         self.player_types = {"black": "human", "white": "llm"}
@@ -134,8 +149,12 @@ class CheckMateGui:
         self.dropdown_index = 0
         self.drag_setting_slider = None
         self.settings_error = ""
+        self.prompts = dict(DEFAULT_PROMPTS)
+        self.prompt_span_cache = {}
         self.system_prompt_expanded = True
-        self.system_prompt_line_cache = None
+        self.notes_prompt_expanded = True
+        self.ng_plus_prompt_expanded = True
+        self.system_prompt_line_cache = {}
         self.play_state = "idle"
         self.play_message = "Ready"
         self.play_can_start = False
@@ -290,6 +309,8 @@ class CheckMateGui:
         self.update_viewport()
 
     def handle_sidebar_event(self, event: pygame.event.Event) -> bool:
+        if self.handle_scrollbar_event(event) or self.handle_thinking_turn_event(event) or self.handle_notes_page_event(event):
+            return True
         if event.type == pygame.MOUSEWHEEL:
             position = getattr(event, "pos", pygame.mouse.get_pos())
             amount = -event.y if getattr(event, "flipped", False) else event.y
@@ -312,6 +333,8 @@ class CheckMateGui:
         for side, rect in self.sidebar_rects.items():
             if event.button == 1:
                 if self.sidebar_toggle_rects[side].collidepoint(event.pos):
+                    self.drag_scrollbar = None
+                    self.end_thinking_turn_edit()
                     self.sidebars[side].expanded = not self.sidebars[side].expanded
                     self.update_viewport()
                     return True
@@ -368,16 +391,84 @@ class CheckMateGui:
     def settings_body(self):
         rect = self.sidebar_rects["left"]
         reserved = 202 if self.agent_play_mode else 100
-        return pygame.Rect(rect.x + 12, rect.y + 88, max(1, rect.w - 24), max(1, rect.h - reserved))
+        return pygame.Rect(rect.x + 12, rect.y + 88, max(1, rect.w - 30), max(1, rect.h - reserved))
+
+    def scrollbar_geometry(self, track, value, maximum, visible, total):
+        if maximum <= 0:
+            return None
+        height = min(track.h, max(28, round(track.h * visible / total)))
+        top = track.y + round((track.h - height) * max(0, min(maximum, value)) / maximum)
+        return track, pygame.Rect(track.x, top, track.w, height), maximum
+
+    def sidebar_scrollbars(self):
+        bars = {}
+        if self.agent_play_mode and self.sidebars["left"].expanded and self.setting_controls():
+            body = self.settings_body()
+            geometry = self.scrollbar_geometry(pygame.Rect(body.right + 3, body.y, 10, body.h),
+                self.settings_scroll, max(0, self.settings_content_height - body.h), body.h, self.settings_content_height)
+            if geometry:
+                bars["settings"] = geometry
+        rect = self.exposure_pane_rects().get("thinking")
+        if rect:
+            body = self.exposure_body(rect)
+            visible = max(1, body.h // (self.exposure_font.get_linesize() + 3))
+            count = self.exposure_line_count("thinking", body.w)
+            geometry = self.scrollbar_geometry(pygame.Rect(rect.right - 15, body.y, 10, body.h),
+                self.exposure_panes["thinking"].scroll, max(0, count - visible), visible, count)
+            if geometry:
+                bars["thinking"] = geometry
+        return bars
+
+    def drag_scrollbar_to(self, y):
+        geometry = self.sidebar_scrollbars().get(self.drag_scrollbar)
+        if geometry is None:
+            self.drag_scrollbar = None
+            return
+        track, thumb, maximum = geometry
+        travel = track.h - thumb.h
+        top = max(0, min(travel, y - track.y - min(self.scrollbar_drag_offset, thumb.h)))
+        value = round(maximum * top / travel) if travel else 0
+        if self.drag_scrollbar == "settings":
+            self.settings_scroll = value
+        else:
+            self.exposure_panes["thinking"].scroll = value
+
+    def handle_scrollbar_event(self, event):
+        if event.type == pygame.WINDOWFOCUSLOST:
+            self.drag_scrollbar = None
+        if self.drag_scrollbar:
+            if event.type == pygame.MOUSEMOTION:
+                self.drag_scrollbar_to(event.pos[1])
+                return True
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self.drag_scrollbar_to(event.pos[1])
+                self.drag_scrollbar = None
+                return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for name, (track, thumb, _) in self.sidebar_scrollbars().items():
+                if track.collidepoint(event.pos):
+                    self.drag_scrollbar = name
+                    self.scrollbar_drag_offset = event.pos[1] - thumb.y if thumb.collidepoint(event.pos) else thumb.h // 2
+                    self.drag_scrollbar_to(event.pos[1])
+                    return True
+        return False
+
+    def draw_scrollbar(self, name, geometry):
+        if geometry:
+            track, thumb, _ = geometry
+            pygame.draw.rect(self.window, (36, 37, 39), track, border_radius=5)
+            pygame.draw.rect(self.window, (71, 67, 59), track, 1, border_radius=5)
+            active = self.drag_scrollbar == name or thumb.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(self.window, (213, 184, 99) if active else (151, 132, 91), thumb, border_radius=5)
 
     def settings_rows(self):
         rows = [("agent_play_mode", "Agent Play Mode", "On" if self.agent_play_mode else "Off")]
         if not self.agent_play_mode:
             return rows
         rows.append(("play_control_mode", "Play Control Mode", self.play_control_mode.capitalize()))
-        labels = {"endpoint": "API Base URL", "api_key": "API Key", "model": "Model",
+        labels = {"endpoint": "API Base URL", "api_key": "API Key", "model": "Model", "streaming": "Streaming",
                   "max_tokens": "Output Token Limit", "token_parameter": "Token Limit Parameter",
-                  "timeout": "Timeout (seconds)", "temperature": "Temperature",
+                  "timeout": "break when no AP cost (s)", "temperature": "Temperature",
                   "reasoning_effort": "Reasoning Effort", "vision": "Image Input"}
         for side in ("black", "white"):
             rows.append(("player:" + side, "Black / First Player" if side == "black" else "White / Second Player",
@@ -392,33 +483,41 @@ class CheckMateGui:
                 value = self.api_profiles[side][key]
                 if key == "api_key":
                     value = "*" * min(12, len(value)) if value else "Click to enter"
-                elif key == "vision":
+                elif key in {"vision", "streaming"}:
                     value = "On" if value else "Off"
                 elif value is None or value == "":
                     value = "Click to enter" if key in {"endpoint", "model"} else "Default"
                 rows.append((f"field:{side}:{key}", title, str(value)))
-                if key == "model":
+                if key == "streaming":
                     state = self.connection_status[side]
                     rows.append((f"test:{side}", "Model Connection", "Testing..." if state == "running" else "Test Connection"))
-        rows.append(("system_prompt", "Default System Prompt", "Hide" if self.system_prompt_expanded else "Show"))
+        rows.append(("system_prompt", "Action Prompt", "Hide" if self.system_prompt_expanded else "Show"))
         if self.system_prompt_expanded:
-            rows.extend([("system_prompt_text", "", SYSTEM_PROMPT), ("copy_system_prompt", "", "Copy Text")])
+            rows.extend([("system_prompt_text", "", self.prompt_text("system_prompt_text")), ("copy_system_prompt", "", "Copy Text")])
+        rows.append(("notes_prompt", "Notes Prompt", "Hide" if self.notes_prompt_expanded else "Show"))
+        if self.notes_prompt_expanded:
+            rows.extend([("notes_prompt_text", "", self.prompt_text("notes_prompt_text")), ("copy_notes_prompt", "", "Copy Text")])
+        rows.append(("ng_plus_prompt", "NG+ Action Prompt", "Hide" if self.ng_plus_prompt_expanded else "Show"))
+        if self.ng_plus_prompt_expanded:
+            rows.extend([("ng_plus_prompt_text", "", self.prompt_text("ng_plus_prompt_text")), ("copy_ng_plus_prompt", "", "Copy Text")])
         return rows
 
-    def system_prompt_lines(self, width):
-        key = (SYSTEM_PROMPT, width)
-        if self.system_prompt_line_cache is None or self.system_prompt_line_cache[0] != key:
+    def system_prompt_lines(self, width, prompt=SYSTEM_PROMPT):
+        key = (prompt, width)
+        if key not in self.system_prompt_line_cache:
             # The existing prompt contains words short enough for a minimum
             # sidebar width; it needs wrapping without an ellipsis limit.
-            lines = self.wrap_text(SYSTEM_PROMPT, max(1, width), max_lines=1000, font=self.exposure_font)
-            self.system_prompt_line_cache = (key, lines)
-        return self.system_prompt_line_cache[1]
+            lines = self.wrap_text(prompt, max(1, width), max_lines=1000, font=self.exposure_font)
+            if len(self.system_prompt_line_cache) >= 8:
+                self.system_prompt_line_cache.clear()
+            self.system_prompt_line_cache[key] = lines
+        return self.system_prompt_line_cache[key]
 
     def setting_row_height(self, name, body):
-        if name == "system_prompt_text":
+        if name in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}:
             line_height = self.exposure_font.get_linesize() + 3
-            return len(self.system_prompt_lines(body.w - 20)) * line_height + 28
-        if name == "copy_system_prompt":
+            return max(3, len(self.prompt_spans(self.prompt_text(name), body.w - 20))) * line_height + 28
+        if name in {"copy_system_prompt", "copy_notes_prompt", "copy_ng_plus_prompt"}:
             return 38
         return 82 if name.startswith("field:") and name.split(":")[-1] in NUMERIC_SETTINGS else 58
 
@@ -434,7 +533,7 @@ class CheckMateGui:
         top = body.y - self.settings_scroll
         for (name, title, value), height in zip(rows, heights):
             indent = character_width * 2 if name.startswith(("profile:", "field:", "test:")) else 0
-            if name == "system_prompt_text":
+            if name in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}:
                 layout.append((name, title, value, pygame.Rect(body.x, top, body.w, height - 8)))
                 top += height
                 continue
@@ -487,8 +586,6 @@ class CheckMateGui:
         body = self.settings_body()
         controls = {}
         for name, _, _, rect in self.settings_layout():
-            if name == "system_prompt_text":
-                continue
             item = self.setting_input_rect(name, rect)
             if item.colliderect(body):
                 controls[name] = item.clip(body)
@@ -543,8 +640,8 @@ class CheckMateGui:
             if not pygame.Rect(rect.x, rect.y - (22 if title else 0), rect.w,
                                rect.h + (22 if title else 0) + 24).colliderect(body):
                 continue
-            if name == "system_prompt_text":
-                self.draw_system_prompt_preview(rect)
+            if name in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}:
+                self.draw_prompt_editor(name, rect)
                 continue
             if name.startswith(("profile:", "field:", "test:")):
                 stem = body.x + self.tooltip_font.size(" ")[0] // 2
@@ -593,11 +690,7 @@ class CheckMateGui:
         self.window.set_clip(original_clip)
         if not self.agent_play_mode:
             return
-        if self.settings_content_height > body.h:
-            height = max(18, int(body.h * body.h / self.settings_content_height))
-            maximum = self.settings_content_height - body.h
-            y = body.y + int((body.h - height) * self.settings_scroll / maximum)
-            pygame.draw.rect(self.window, (118, 106, 84), (body.right + 3, y, 3, height))
+        self.draw_scrollbar("settings", self.sidebar_scrollbars().get("settings"))
         bar = self.sidebar_rects["left"]
         pygame.draw.line(self.window, (71, 67, 59), (body.x, bar.bottom - 106), (body.right, bar.bottom - 106))
         message = self.settings_error or self.play_message
@@ -624,11 +717,95 @@ class CheckMateGui:
             label = self.tooltip_font.render(name.capitalize(), True, (234, 222, 199))
             self.window.blit(label, label.get_rect(center=(x, rect.bottom - 11)))
 
-    def draw_system_prompt_preview(self, rect):
+    def prompt_text(self, name):
+        return self.setting_editor.text if self.active_setting == name else self.prompts[name.removesuffix("_text")]
+
+    def prompt_spans(self, text, width):
+        key = (text, width)
+        if key not in self.prompt_span_cache:
+            spans, start, pos, last_space = [], 0, 0, None
+            while pos < len(text):
+                if text[pos] == "\n":
+                    spans.append((start, pos))
+                    start, pos, last_space = pos + 1, pos + 1, None
+                    continue
+                if pos > start and self.exposure_font.size(text[start:pos + 1])[0] > width:
+                    end = last_space + 1 if last_space is not None else pos
+                    spans.append((start, end))
+                    start, pos, last_space = end, end, None
+                    continue
+                if text[pos].isspace():
+                    last_space = pos
+                pos += 1
+            spans.append((start, len(text)))
+            if len(self.prompt_span_cache) >= 8:
+                self.prompt_span_cache.clear()
+            self.prompt_span_cache[key] = spans
+        return self.prompt_span_cache[key]
+
+    def prompt_cursor_row(self, spans):
+        cursor = self.setting_editor.cursor
+        return max(index for index, (start, end) in enumerate(spans) if start <= cursor)
+
+    def prompt_cursor_at(self, rect, position):
+        text = self.setting_editor.text
+        spans = self.prompt_spans(text, rect.w - 20)
+        row = max(0, min(len(spans) - 1, (position[1] - rect.y - 10) // (self.exposure_font.get_linesize() + 3)))
+        start, end = spans[row]
+        x = position[0] - rect.x - 10
+        return min(range(start, end + 1), key=lambda i: abs(self.exposure_font.size(text[start:i])[0] - x))
+
+    def ensure_prompt_cursor_visible(self):
+        name = self.active_setting
+        if name not in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}:
+            return
+        rect = next(rect for item, _, _, rect in self.settings_layout() if item == name)
+        spans = self.prompt_spans(self.setting_editor.text, rect.w - 20)
+        row = self.prompt_cursor_row(spans)
+        height = self.exposure_font.get_linesize() + 3
+        y = rect.y + 10 + row * height
+        body = self.settings_body()
+        if y < body.top:
+            self.settings_scroll -= body.top - y
+        elif y + height > body.bottom:
+            self.settings_scroll += y + height - body.bottom
+        start = spans[row][0]
+        x = rect.x + 10 + self.exposure_font.size(self.setting_editor.text[start:self.setting_editor.cursor])[0]
+        pygame.key.set_text_input_rect(pygame.Rect(x, max(body.top, min(y, body.bottom - height)), 2, height))
+
+    def draw_prompt_editor(self, name, rect):
+        active = self.active_setting == name
+        text = self.prompt_text(name)
+        spans = self.prompt_spans(text, rect.w - 20)
+        height = self.exposure_font.get_linesize() + 3
+        pygame.draw.rect(self.window, (21, 23, 26), rect, border_radius=4)
+        pygame.draw.rect(self.window, (213, 184, 99) if active else (71, 67, 59), rect, 1, border_radius=4)
+        original_clip = self.window.get_clip()
+        self.window.set_clip(rect.inflate(-12, -12).clip(original_clip))
+        selected_start, selected_end = self.setting_editor.selection if active else (0, 0)
+        first = max(0, (original_clip.top - rect.y - 10) // height)
+        last = min(len(spans), (original_clip.bottom - rect.y - 10) // height + 1)
+        for row in range(first, last):
+            start, end = spans[row]
+            x, y = rect.x + 10, rect.y + 10 + row * height
+            if selected_start < end and selected_end > start:
+                left = self.exposure_font.size(text[start:max(start, selected_start)])[0]
+                right = self.exposure_font.size(text[start:min(end, selected_end)])[0]
+                pygame.draw.rect(self.window, (65, 93, 130), (x + left, y, max(2, right-left), height))
+            self.window.blit(self.exposure_font.render(text[start:end], True, (224, 225, 229)), (x, y))
+        if active:
+            row = self.prompt_cursor_row(spans)
+            x = rect.x + 10 + self.exposure_font.size(text[spans[row][0]:self.setting_editor.cursor])[0]
+            y = rect.y + 10 + row * height
+            if pygame.time.get_ticks() % 1000 < 650:
+                pygame.draw.line(self.window, (245, 245, 245), (x, y), (x, y + height - 3))
+        self.window.set_clip(original_clip)
+
+    def draw_system_prompt_preview(self, rect, prompt=SYSTEM_PROMPT):
         pygame.draw.rect(self.window, (21, 23, 26), rect, border_radius=4)
         pygame.draw.rect(self.window, (71, 67, 59), rect, 1, border_radius=4)
         line_height = self.exposure_font.get_linesize() + 3
-        lines = self.system_prompt_lines(rect.w - 20)
+        lines = self.system_prompt_lines(rect.w - 20, prompt)
         original_clip = self.window.get_clip()
         self.window.set_clip(rect.inflate(-12, -12).clip(original_clip))
         first = max(0, (original_clip.top - rect.y - 10) // line_height)
@@ -701,10 +878,168 @@ class CheckMateGui:
                                  available.w, available.h - upper_height - 10),
         }
 
+    def thinking_turns(self):
+        return sorted({entry["turn"] for entry in self.exposure_panes["thinking"].messages
+                       if type(entry.get("turn")) is int})
+
+    def thinking_messages(self):
+        messages = self.exposure_panes["thinking"].messages
+        if self.thinking_turn is None:
+            return messages
+        turns = self.thinking_turns()
+        latest = turns[-1] if turns else None
+        return [entry for entry in messages if entry.get("turn") == self.thinking_turn
+                or (entry.get("turn") is None and self.thinking_turn == latest)]
+
+    def select_thinking_turn(self, turn):
+        if type(turn) is not int or turn < 1:
+            return False
+        pane = self.exposure_panes["thinking"]
+        self.thinking_scroll_positions[self.thinking_turn] = pane.scroll
+        self.thinking_turn = turn
+        turns = self.thinking_turns()
+        self.thinking_follow_latest = bool(turns and turn == turns[-1])
+        pane.scroll = self.thinking_scroll_positions.get(turn, 0)
+        self.chat_layout_cache = None
+        self.exposure_line_cache.pop("thinking", None)
+        return True
+
+    def thinking_turn_controls(self):
+        rect = self.exposure_pane_rects().get("thinking")
+        if rect is None or rect.w < 116:
+            return {}
+        field_width = 48 if rect.w >= 220 else 36
+        right = pygame.Rect(rect.right - 10 - 22, rect.y + 5, 22, 24)
+        field = pygame.Rect(right.x - 4 - field_width, right.y, field_width, right.h)
+        left = pygame.Rect(field.x - 4 - 22, right.y, 22, right.h)
+        return {"previous": left, "turn": field, "next": right}
+
+    def adjacent_thinking_turn(self, direction):
+        turns = self.thinking_turns()
+        current = self.thinking_turn
+        if current is None:
+            return None
+        candidates = [turn for turn in turns if (turn - current) * direction > 0]
+        return (min(candidates) if direction > 0 else max(candidates)) if candidates else None
+
+    def end_thinking_turn_edit(self):
+        if self.thinking_turn_editing:
+            pygame.key.stop_text_input()
+        self.thinking_turn_editing = self.thinking_turn_invalid = False
+
+    def insert_thinking_turn_text(self, text):
+        if text and text.isascii() and text.isdecimal():
+            editor = self.thinking_turn_editor
+            start, end = editor.selection
+            editor.insert(text[:max(0, 6 - len(editor.text) + end - start)])
+            self.thinking_turn_invalid = False
+
+    def handle_thinking_turn_event(self, event):
+        controls = self.thinking_turn_controls()
+        if event.type == pygame.WINDOWFOCUSLOST or not controls:
+            self.end_thinking_turn_edit()
+        if self.thinking_turn_editing:
+            editor = self.thinking_turn_editor
+            if event.type == pygame.TEXTINPUT:
+                self.insert_thinking_turn_text(event.text)
+                return True
+            if event.type == pygame.KEYDOWN:
+                modifiers = getattr(event, "mod", 0)
+                control, shift = bool(modifiers & pygame.KMOD_CTRL), bool(modifiers & pygame.KMOD_SHIFT)
+                if event.key in {pygame.K_RETURN, pygame.K_KP_ENTER}:
+                    turn = int(editor.text) if editor.text else 0
+                    if self.select_thinking_turn(turn):
+                        self.end_thinking_turn_edit()
+                    else:
+                        self.thinking_turn_invalid = True
+                elif event.key == pygame.K_ESCAPE:
+                    self.end_thinking_turn_edit()
+                elif control and event.key == pygame.K_a:
+                    editor.select_all()
+                elif control and event.key == pygame.K_v:
+                    try:
+                        self.insert_thinking_turn_text(read_clipboard().strip())
+                    except (OSError, pygame.error, UnicodeError):
+                        self.thinking_turn_invalid = True
+                elif event.key in {pygame.K_BACKSPACE, pygame.K_DELETE}:
+                    editor.delete(backward=event.key == pygame.K_BACKSPACE, word=control)
+                    self.thinking_turn_invalid = False
+                elif event.key in {pygame.K_LEFT, pygame.K_RIGHT}:
+                    editor.move(-1 if event.key == pygame.K_LEFT else 1, extend=shift, word=control)
+                elif event.key in {pygame.K_HOME, pygame.K_END}:
+                    editor.set_cursor(0 if event.key == pygame.K_HOME else len(editor.text), extend=shift)
+                return True
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                self.end_thinking_turn_edit()
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for name, rect in controls.items():
+                if rect.collidepoint(event.pos):
+                    if name == "turn":
+                        self.thinking_turn_editor.load(str(self.thinking_turn or ""))
+                        self.thinking_turn_editor.select_all()
+                        self.thinking_turn_editing = True
+                        pygame.key.start_text_input()
+                        pygame.key.set_text_input_rect(rect)
+                    else:
+                        turn = self.adjacent_thinking_turn(-1 if name == "previous" else 1)
+                        if turn is not None:
+                            self.select_thinking_turn(turn)
+                    return True
+        return False
+
+    def draw_thinking_turn_controls(self, controls):
+        for name in ("previous", "next"):
+            rect = controls[name]
+            direction = -1 if name == "previous" else 1
+            enabled = self.adjacent_thinking_turn(direction) is not None
+            pygame.draw.rect(self.window, (58, 61, 65), rect, border_radius=3)
+            color = (234, 222, 199) if enabled else (104, 105, 108)
+            x, y = rect.center
+            pygame.draw.lines(self.window, color, False, [(x - direction * 3, y - 4),
+                                                        (x + direction * 3, y), (x - direction * 3, y + 4)], 2)
+        rect = controls["turn"]
+        pygame.draw.rect(self.window, (27, 29, 32), rect, border_radius=3)
+        border = ((235, 74, 72) if self.thinking_turn_invalid else (213, 184, 99)
+                  if self.thinking_turn_editing else (110, 103, 88))
+        pygame.draw.rect(self.window, border, rect, 1, border_radius=3)
+        if not self.thinking_turn_editing:
+            text = str(self.thinking_turn) if self.thinking_turn is not None else "–"
+            label = self.tooltip_font.render(self.fit_setting_text(text, rect.w - 8), True, (234, 222, 199))
+            self.window.blit(label, label.get_rect(center=rect.center))
+            return
+        editor, font = self.thinking_turn_editor, self.tooltip_font
+        caret = font.size(editor.text[:editor.cursor])[0]
+        editor.offset = max(0, min(editor.offset, caret))
+        editor.offset = max(editor.offset, caret - (rect.w - 12))
+        origin, y = rect.x + 5 - editor.offset, rect.centery - font.get_height() // 2
+        clip = self.window.get_clip()
+        self.window.set_clip(rect.inflate(-6, -4).clip(clip))
+        start, end = editor.selection
+        if start != end:
+            pygame.draw.rect(self.window, (72, 99, 131), (origin + font.size(editor.text[:start])[0], y,
+                font.size(editor.text[start:end])[0], font.get_height()))
+        self.window.blit(font.render(editor.text, True, (234, 222, 199)), (origin, y))
+        if pygame.time.get_ticks() % 1000 < 650:
+            pygame.draw.line(self.window, (234, 222, 199), (origin + caret, rect.y + 4), (origin + caret, rect.bottom - 4))
+        self.window.set_clip(clip)
+
     def set_exposure_content(self, thinking=None, notes=None):
         """Replace either pane's current text, keeping the other pane intact."""
         for name, value in (("thinking", thinking), ("notes", notes)):
             if value is not None:
+                if name == "thinking":
+                    self.thinking_turn = None
+                    self.thinking_follow_latest = True
+                    self.thinking_scroll_positions.clear()
+                    self.end_thinking_turn_edit()
+                    if self.drag_scrollbar == "thinking":
+                        self.drag_scrollbar = None
+                if name == "notes":
+                    self.notes_side = "black"
+                    self.notes_by_side = {}
+                    self.notes_summary = ""
+                    self.notes_scroll_positions = {}
+                    self.notes_page_initialized = False
                 self.exposure_panes[name].text = str(value)
                 self.exposure_panes[name].scroll = 0
                 self.exposure_panes[name].colors = []
@@ -713,7 +1048,75 @@ class CheckMateGui:
                 self.chat_layout_cache = None
                 self.exposure_line_cache.pop(name, None)
 
-    def append_exposure_output(self, text, color=None, side=None):
+    def set_side_notes(self, notes, summary=""):
+        """Refresh stored notes while preserving the selected side and reading position."""
+        if not self.notes_page_initialized and any(notes.get(side) for side in ("black", "white")):
+            self.notes_side = "black" if notes.get("black") else "white"
+            self.notes_page_initialized = True
+        self.notes_by_side = {side: notes.get(side, "") for side in ("black", "white")}
+        self.notes_summary = summary
+        self.refresh_notes_page()
+
+    def refresh_notes_page(self):
+        pane = self.exposure_panes["notes"]
+        text = self.notes_by_side.get(self.notes_side, "")
+        if self.notes_summary:
+            text += ("\n\n" if text else "") + self.notes_summary
+        if pane.text != text:
+            pane.text = text
+            pane.messages = []
+            pane.colors = []
+            self.exposure_line_cache.pop("notes", None)
+
+    def select_notes_side(self, side):
+        if side not in {"black", "white"}:
+            return False
+        pane = self.exposure_panes["notes"]
+        self.notes_scroll_positions[self.notes_side] = pane.scroll
+        self.notes_side = side
+        self.notes_page_initialized = True
+        pane.scroll = self.notes_scroll_positions.get(side, 0)
+        self.refresh_notes_page()
+        return True
+
+    def notes_page_controls(self):
+        rect = self.exposure_pane_rects().get("notes")
+        if rect is None or rect.w < 116:
+            return {}
+        right = pygame.Rect(rect.right - 32, rect.y + 5, 22, 24)
+        field = pygame.Rect(right.x - 60, right.y, 56, right.h)
+        left = pygame.Rect(field.x - 26, right.y, 22, right.h)
+        return {"previous": left, "side": field, "next": right}
+
+    def handle_notes_page_event(self, event):
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return False
+        for name, rect in self.notes_page_controls().items():
+            if rect.collidepoint(event.pos):
+                if name == "previous":
+                    self.select_notes_side("black")
+                elif name == "next":
+                    self.select_notes_side("white")
+                return True
+        return False
+
+    def draw_notes_page_controls(self, controls):
+        for name in ("previous", "next"):
+            rect = controls[name]
+            direction = -1 if name == "previous" else 1
+            enabled = self.notes_side == ("white" if direction < 0 else "black")
+            pygame.draw.rect(self.window, (58, 61, 65), rect, border_radius=3)
+            color = (234, 222, 199) if enabled else (104, 105, 108)
+            x, y = rect.center
+            pygame.draw.lines(self.window, color, False, [(x - direction * 3, y - 4),
+                                (x + direction * 3, y), (x - direction * 3, y + 4)], 2)
+        rect = controls["side"]
+        pygame.draw.rect(self.window, (27, 29, 32), rect, border_radius=3)
+        pygame.draw.rect(self.window, (110, 103, 88), rect, 1, border_radius=3)
+        label = self.tooltip_font.render(self.notes_side.capitalize(), True, (234, 222, 199))
+        self.window.blit(label, label.get_rect(center=rect.center))
+
+    def append_exposure_output(self, text, color=None, side=None, request_id=None, turn=None):
         """Keep this live game's received output; follow the tail only when at it."""
         pane = self.exposure_panes["thinking"]
         rect = self.exposure_pane_rects().get("thinking")
@@ -722,13 +1125,28 @@ class CheckMateGui:
             body = self.exposure_body(rect)
             visible = max(1, body.h // (self.exposure_font.get_linesize() + 3))
             follow_tail = pane.scroll >= max(0, self.exposure_line_count("thinking", body.w) - visible)
-        separator = "\n\n" if pane.text else ""
-        start = len(pane.text) + len(separator)
-        pane.text += separator + str(text)
-        pane.messages.append({"text": str(text), "side": side, "color": color})
+        entry = next((item for item in pane.messages if request_id is not None
+                      and item.get("request_id") == request_id), None)
+        if entry is None:
+            entry = {"text": str(text), "side": side, "color": color}
+            if request_id is not None:
+                entry["request_id"] = request_id
+            pane.messages.append(entry)
+        else:
+            entry.update(text=str(text), side=side, color=color)
+        if type(turn) is int and turn > 0:
+            entry["turn"] = turn
+        turns = self.thinking_turns()
+        if turns and self.thinking_follow_latest and self.thinking_turn != turns[-1]:
+            self.select_thinking_turn(turns[-1])
+            follow_tail = True
+        pane.text = "\n\n".join(item["text"] for item in pane.messages)
+        pane.colors, offset = [], 0
+        for item in pane.messages:
+            if item["color"] is not None:
+                pane.colors.append((offset, offset + len(item["text"]), item["color"]))
+            offset += len(item["text"]) + 2
         self.chat_layout_cache = None
-        if color is not None:
-            pane.colors.append((start, len(pane.text), color))
         self.exposure_line_cache.pop("thinking", None)
         if follow_tail:
             pane.scroll = (max(0, self.exposure_line_count("thinking", body.w) - visible)
@@ -736,8 +1154,19 @@ class CheckMateGui:
 
     def exposure_lines(self, name, width):
         pane = self.exposure_panes[name]
-        text = pane.text or pane.placeholder
-        key = (text, width, tuple(pane.colors))
+        styles = pane.colors
+        if name == "thinking":
+            messages = self.thinking_messages()
+            text = "\n\n".join(entry["text"] for entry in messages)
+            styles, offset = [], 0
+            for entry in messages:
+                if entry["color"] is not None:
+                    styles.append((offset, offset + len(entry["text"]), entry["color"]))
+                offset += len(entry["text"]) + 2
+            text = text or (f"No model output for turn {self.thinking_turn}." if self.thinking_turn is not None else pane.placeholder)
+        else:
+            text = pane.text or pane.placeholder
+        key = (text, width, tuple(styles))
         cached = self.exposure_line_cache.get(name)
         if cached is None or cached[0] != key:
             lines, colors = [], []
@@ -746,7 +1175,7 @@ class CheckMateGui:
                 lines.append(value)
                 colors.append(color)
             for paragraph in text.split("\n"):
-                color = next((color for start, end, color in pane.colors if start <= offset < end), None)
+                color = next((color for start, end, color in styles if start <= offset < end), None)
                 line = ""
                 for token in re.findall(r"\s+|[A-Za-z0-9_]+|.", paragraph):
                     if self.exposure_font.size(line + token)[0] > width and line:
@@ -772,10 +1201,55 @@ class CheckMateGui:
         return cached[1]
 
     def exposure_body(self, rect):
-        return pygame.Rect(rect.x + 10, rect.y + 34, max(1, rect.w - 26), max(1, rect.h - 44))
+        thinking = rect == self.exposure_pane_rects().get("thinking")
+        return pygame.Rect(rect.x + 10, rect.y + 34, max(1, rect.w - (32 if thinking else 26)), max(1, rect.h - 44))
+
+    def wrap_chat_suffix(self, text, width):
+        lines, starts, offset = [], [], 0
+        for paragraph in text.split("\n"):
+            line, start = "", offset
+            for match in re.finditer(r"\s+|[A-Za-z0-9_]+|.", paragraph):
+                token, position = match.group(), offset + match.start()
+                if line and self.exposure_font.size(line + token)[0] > width:
+                    lines.append(line.rstrip())
+                    starts.append(start)
+                    stripped = token.lstrip()
+                    start = position + len(token) - len(stripped)
+                    line, token, position = "", stripped, start
+                if self.exposure_font.size(line + token)[0] <= width:
+                    line += token
+                    continue
+                for index, char in enumerate(token):
+                    if line and self.exposure_font.size(line + char)[0] > width:
+                        lines.append(line.rstrip())
+                        starts.append(start)
+                        line, start = "", position + index
+                    line += char
+            lines.append(line.rstrip())
+            starts.append(start)
+            offset += len(paragraph) + 1
+        return lines, starts
+
+    def chat_entry_lines(self, entry, width):
+        """Reuse completed bubbles and rewrap only an appended message's tail."""
+        text, cache = entry["text"], entry.get("_wrap_cache")
+        if cache and cache["width"] == width:
+            if text == cache["text"]:
+                return cache["lines"]
+            if text.startswith(cache["text"]):
+                start = cache["starts"][-1]
+                lines, starts = self.wrap_chat_suffix(text[start:], width)
+                lines = cache["lines"][:-1] + lines
+                starts = cache["starts"][:-1] + [start + position for position in starts]
+            else:
+                lines, starts = self.wrap_chat_suffix(text, width)
+        else:
+            lines, starts = self.wrap_chat_suffix(text, width)
+        entry["_wrap_cache"] = {"text": text, "width": width, "lines": lines, "starts": starts}
+        return lines
 
     def chat_layout(self, width):
-        messages = self.exposure_panes["thinking"].messages
+        messages = self.thinking_messages()
         key = (width, tuple((entry["text"], entry["side"], entry["color"]) for entry in messages))
         if self.chat_layout_cache and self.chat_layout_cache[0] == key:
             return self.chat_layout_cache[1:]
@@ -787,19 +1261,7 @@ class CheckMateGui:
             padding = 8 if inset else 0
             item_width = max(1, width - inset)
             wrap_width = max(1, item_width - padding * 2)
-            lines = []
-            for paragraph in entry["text"].split("\n"):
-                line = ""
-                for token in re.findall(r"\s+|[A-Za-z0-9_]+|.", paragraph):
-                    if line and self.exposure_font.size(line + token)[0] > wrap_width:
-                        lines.append(line.rstrip())
-                        line, token = "", token.lstrip()
-                    for char in token:
-                        if line and self.exposure_font.size(line + char)[0] > wrap_width:
-                            lines.append(line)
-                            line = ""
-                        line += char
-                lines.append(line.rstrip())
+            lines = self.chat_entry_lines(entry, wrap_width)
             height = len(lines) * line_height + padding * 2
             layout.append({**entry, "rect": pygame.Rect(inset if side == "white" else 0, top, item_width, height),
                            "lines": lines, "padding": padding})
@@ -809,7 +1271,7 @@ class CheckMateGui:
         return layout, count
 
     def exposure_line_count(self, name, width):
-        if name == "thinking" and self.exposure_panes[name].messages:
+        if name == "thinking" and self.thinking_messages():
             return self.chat_layout(width)[1]
         return len(self.exposure_lines(name, width))
 
@@ -821,8 +1283,8 @@ class CheckMateGui:
                 continue
             side = entry["side"]
             if side in {"black", "white"}:
-                background = (245, 245, 242) if side == "black" else (5, 5, 7)
-                foreground = (20, 20, 22) if side == "black" else (245, 245, 245)
+                background = (5, 5, 7) if side == "black" else (245, 245, 242)
+                foreground = (245, 245, 245) if side == "black" else (20, 20, 22)
                 pygame.draw.rect(self.window, background, rect, border_radius=8)
             else:
                 foreground = entry["color"] or (224, 225, 229)
@@ -852,16 +1314,30 @@ class CheckMateGui:
             pygame.draw.rect(self.window, (21, 23, 26), rect, border_radius=4)
             pygame.draw.rect(self.window, (71, 67, 59), rect, 1, border_radius=4)
             self.window.set_clip(rect.clip(original_clip))
-            title = self.small_font.render(pane.title, True, (225, 213, 191))
+            navigation = self.thinking_turn_controls() if name == "thinking" else self.notes_page_controls()
+            title_width = navigation["previous"].left - rect.x - 16 if navigation else rect.w - 20
+            title = self.small_font.render(self.fit_text(pane.title, max(1, title_width), self.small_font), True, (225, 213, 191))
             self.window.blit(title, (rect.x + 10, rect.y + 8))
+            if navigation:
+                if name == "thinking":
+                    self.draw_thinking_turn_controls(navigation)
+                else:
+                    self.draw_notes_page_controls(navigation)
             body = self.exposure_body(rect)
-            lines = self.exposure_lines(name, body.w)
+            has_messages = name == "thinking" and bool(self.thinking_messages())
+            lines = [] if has_messages else self.exposure_lines(name, body.w)
             count = self.exposure_line_count(name, body.w)
             visible = max(1, body.h // line_height)
             pane.scroll = min(pane.scroll, max(0, count - visible))
             self.window.set_clip(body.clip(rect).clip(original_clip))
             color = (224, 225, 229) if pane.text else (144, 145, 148)
-            if name == "thinking" and pane.messages:
+            if name == "notes":
+                background = (5, 5, 7) if self.notes_side == "black" else (245, 245, 242)
+                color = (245, 245, 245) if self.notes_side == "black" else (20, 20, 22)
+                self.window.set_clip(rect.clip(original_clip))
+                pygame.draw.rect(self.window, background, pygame.Rect(rect.x + 1, body.y - 2, rect.w - 2, rect.bottom - body.y + 1))
+                self.window.set_clip(body.clip(rect).clip(original_clip))
+            if has_messages:
                 self.draw_chat_messages(body, pane)
             else:
                 for index, line in enumerate(lines[pane.scroll:pane.scroll + visible]):
@@ -869,7 +1345,9 @@ class CheckMateGui:
                     label = self.exposure_font.render(line, True, styled or color)
                     self.window.blit(label, (body.x, body.y + index * line_height))
             self.window.set_clip(original_clip)
-            if count > visible:
+            if name == "thinking":
+                self.draw_scrollbar("thinking", self.sidebar_scrollbars().get("thinking"))
+            elif count > visible:
                 track = pygame.Rect(rect.right - 7, body.y, 3, body.h)
                 height = min(track.h, max(12, round(track.h * visible / count)))
                 top = track.y + round((track.h - height) * pane.scroll / (count - visible))
@@ -1337,6 +1815,15 @@ class CheckMateGui:
             if rect is not None:
                 self.draw_legal_hint_corners(rect)
 
+        interaction = self.get_value(game, "interaction", None)
+        for position in self.get_value(interaction, "selected_cost", []) or []:
+            rect = self.rect_for_logical_cell(*position)
+            if rect is not None and self.piece_at(board, position) is not None:
+                points = [(rect.right - 34, rect.top + 23), (rect.right - 24, rect.top + 33),
+                          (rect.right - 9, rect.top + 12)]
+                pygame.draw.lines(self.screen, (17, 27, 18), False, points, 10)
+                pygame.draw.lines(self.screen, LEGAL_HINT_COLOR, False, points, 6)
+
     def draw_outer_logical_pieces(self, board: list[list[Any]]) -> None:
         for y, row in enumerate(board):
             for x, piece in enumerate(row):
@@ -1355,10 +1842,13 @@ class CheckMateGui:
         pygame.draw.line(self.screen, (255, 255, 255), rect.topleft, rect.bottomleft, 1)
 
     def draw_piece(self, rect: pygame.Rect, side: str, kind: str, rooted: bool = True) -> None:
-        cell_name = f"{side}_diagonal_cell" if kind == "tree" and not rooted else f"{side}_cell"
-        if kind == "butterfly":
-            cell_name = f"{side}_eight_cell"
-        self.screen.blit(self.images[cell_name], rect.topleft)
+        if kind == "tree" and rooted:
+            pygame.draw.rect(self.screen, (0, 0, 0) if side == "black" else (255, 255, 255), rect)
+        else:
+            cell_name = f"{side}_diagonal_cell" if kind == "tree" else f"{side}_cell"
+            if kind == "butterfly":
+                cell_name = f"{side}_eight_cell"
+            self.screen.blit(self.images[cell_name], rect.topleft)
         image_key = {
             "squirrel": "squirrel",
             "acorn": "acorn",
@@ -1461,7 +1951,7 @@ class CheckMateGui:
         x1 = rect.right - 1 - LEGAL_HINT_INSET
         y1 = rect.bottom - 1 - LEGAL_HINT_INSET
         arm = min(LEGAL_HINT_ARM, min(rect.w, rect.h) // 3)
-        color = LEGAL_HINT_COLOR
+        color = self.legal_hint_color
         width = LEGAL_HINT_WIDTH
         segments = [((x0, y0), (x0 + arm, y0)), ((x0, y0), (x0, y0 + arm)),
                     ((x1, y0), (x1 - arm, y0)), ((x1, y0), (x1, y0 + arm)),

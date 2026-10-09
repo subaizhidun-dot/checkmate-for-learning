@@ -13,6 +13,7 @@ NUMERIC_SETTINGS = {
 
 class LineEditor:
     def __init__(self):
+        self.multiline = False
         self.text = ""
         self.cursor = 0
         self.anchor = None
@@ -40,9 +41,11 @@ class LineEditor:
         return self.text[start:end]
 
     def insert(self, text):
-        text = text.replace("\r", "").replace("\n", "").replace("\x00", "")
+        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+        if not self.multiline:
+            text = text.replace("\n", "")
         start, end = self.selection
-        available = max(0, 4096 - len(self.text) + end - start)
+        available = max(0, (65536 if self.multiline else 4096) - len(self.text) + end - start)
         text = text[:available]
         self.text = self.text[:start] + text + self.text[end:]
         self.cursor, self.anchor = start + len(text), None

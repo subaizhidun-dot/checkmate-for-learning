@@ -8,7 +8,7 @@ class LLMUsage:
         self._by_id = {}
         self.revision = 0
 
-    def begin_request(self, request_id, side, turn=None):
+    def begin_request(self, request_id, side, turn=None, purpose="play"):
         if not isinstance(request_id, str) or not request_id or side not in {"black", "white"}:
             raise ValueError("Invalid request identity")
         if turn is not None and (type(turn) is not int or turn < 1):
@@ -19,6 +19,8 @@ class LLMUsage:
             return False
         entry = {"request_id": request_id, "side": side, "turn": turn, "status": "pending",
                  "input_tokens": None, "output_tokens": None, "total_tokens": None}
+        if purpose != "play":
+            entry["purpose"] = purpose
         self.requests.append(entry)
         self._by_id[request_id] = entry
         self.revision += 1
@@ -73,7 +75,8 @@ class LLMUsage:
             if not isinstance(item, dict):
                 continue
             try:
-                fresh = result.begin_request(item["request_id"], item["side"], item.get("turn"))
+                fresh = result.begin_request(item["request_id"], item["side"], item.get("turn"),
+                                             "notes" if item.get("purpose") == "notes" else "play")
                 if fresh:
                     status = item.get("status", "stopped")
                     result.finish_request(item["request_id"], item,

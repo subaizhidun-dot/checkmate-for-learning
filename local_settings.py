@@ -9,6 +9,7 @@ import base64
 import ctypes
 from copy import deepcopy
 from settings_widgets import NUMERIC_SETTINGS
+from agent_prompts import DEFAULT_PROMPTS
 from pathlib import Path
 
 
@@ -24,9 +25,9 @@ def settings_path() -> Path:
 
 
 def default_profile():
-    return {"endpoint": "", "api_key": "", "model": "", "max_tokens": 4096,
+    return {"endpoint": "", "api_key": "", "model": "", "max_tokens": 32768,
             "token_parameter": "max_tokens", "timeout": 120, "temperature": None,
-            "reasoning_effort": "default", "vision": True}
+            "reasoning_effort": "default", "vision": True, "streaming": True}
 
 
 def _crypt_key(value: bytes, decrypt=False) -> bytes:
@@ -63,6 +64,9 @@ def _preferences(data) -> dict:
     profiles = data.get("api_profiles", {})
     if not isinstance(profiles, dict):
         profiles = {}
+    prompts = data.get("prompts", {})
+    if not isinstance(prompts, dict):
+        prompts = {}
     result = {
         "agent_play_mode": data.get("agent_play_mode") is True,
         "llm_color": legacy_side,
@@ -70,6 +74,8 @@ def _preferences(data) -> dict:
         "player_types": {side: (players.get(side) if players.get(side) in ("human", "llm")
                                 else "llm" if side == legacy_side else "human") for side in ("black", "white")},
         "api_profiles": {},
+        "prompts": {name: value if isinstance(value := prompts.get(name), str) and value.strip()
+                    and len(value) <= 65536 else default for name, default in DEFAULT_PROMPTS.items()},
     }
     for side in ("black", "white"):
         profile = default_profile()
@@ -91,6 +97,7 @@ def _preferences(data) -> dict:
         if raw.get("reasoning_effort") in ("default", "none", "low", "medium", "high"):
             profile["reasoning_effort"] = raw["reasoning_effort"]
         profile["vision"] = raw.get("vision", True) is True
+        profile["streaming"] = raw.get("streaming", True) is True
         result["api_profiles"][side] = profile
     return result
 

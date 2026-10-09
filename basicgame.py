@@ -4,6 +4,8 @@ from __future__ import annotations
 
 Position = tuple[int, int]
 SPECIAL_KINDS = ("elephant", "lion", "mole", "butterfly")
+SELL_REFUND = {"elephant": 1, "lion": 2, "mole": 1, "butterfly": 2}
+MODE_SPECIALS = {1: ("elephant", "lion"), 2: ("mole", "lion"), 3: ("elephant", "lion", "butterfly")}
 
 
 class Resource:
@@ -320,8 +322,20 @@ def can_select_piece(
 ) -> bool:
     from game2 import tree_action
     from game3 import can_start_extra_turn
-    return bool(get_legal_moves_for_piece(board, players, log_pos) or tree_action(board, log_pos)
+    piece = board.get_piece(log_pos) if board.is_inside_board(log_pos) else None
+    return bool((piece is not None and can_sell_special(board, log_pos, piece.kind))
+                or get_legal_moves_for_piece(board, players, log_pos) or tree_action(board, log_pos)
                 or can_start_extra_turn(board, log_pos))
+
+
+def can_sell_special(board, position, kind):
+    """The sold piece frees one cell; every refunded squirrel needs a cell."""
+    if board is None or kind not in MODE_SPECIALS.get(board.gamemode, ()) or board.current_ap < 1:
+        return False
+    piece = board.get_piece(position) if board.is_inside_board(position) else None
+    return (piece is not None and piece.owner == board.current_player and piece.kind == kind
+            and is_player_accessible(board, position)
+            and len(get_empty_accessible_cells(board)) + 1 >= SELL_REFUND[kind])
 
 
 def can_buy_special(board, players, kind):
@@ -367,7 +381,7 @@ def can_select_resource(
             and selected_piece.owner == board.current_player
             and selected_piece.kind == resource_id
         ):
-            return board.current_ap >= 1
+            return can_sell_special(board, selected_pos, resource_id)
         return can_buy_special(board, players, resource_id)
 
     if resource_id in {"lion", "butterfly"}:
@@ -376,7 +390,7 @@ def can_select_resource(
             and selected_piece.owner == board.current_player
             and selected_piece.kind == resource_id
         ):
-            return board.current_ap >= 1 and len(empty_cells) >= 1
+            return can_sell_special(board, selected_pos, resource_id)
         return can_buy_special(board, players, resource_id)
 
     if resource_id == "time_token":

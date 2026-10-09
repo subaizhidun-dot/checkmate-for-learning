@@ -111,6 +111,46 @@ class G2Tests(unittest.TestCase):
         self.assertEqual(s.game.expanded_corners, {"lower_left"})
         self.assertEqual(s.game.get_piece((6, 1)).owner, "white")
 
+    def test_enemy_uproot_requires_own_lion_and_two_ap(self):
+        for side in ("black", "white"):
+            other = "white" if side == "black" else "black"
+            position = (6, 3) if side == "black" else (2, 3)
+            corner = "upper_right" if side == "black" else "lower_left"
+            original, shifted = ((6, 1), (6, 0)) if side == "black" else ((2, 5), (2, 6))
+            for lion_owner, ap, expected in ((None, 3, False), (other, 3, False),
+                                             (side, 1, False), (side, 2, True), (side, 3, True)):
+                with self.subTest(side=side, lion_owner=lion_owner, ap=ap):
+                    s = ready()
+                    s.game.current_player = side
+                    s.game.current_ap = ap
+                    if lion_owner:
+                        s.game.set_piece((4, 4), Resource(lion_owner, "lion"))
+                    s.refresh_players()
+                    actions = {a["type"] for a in s.legal_actions()
+                               if a["params"].get("at") == list(position)}
+                    self.assertEqual("uproot_tree" in actions, expected)
+                    self.assertEqual("select_piece" in actions, expected)
+                    self.assertFalse(get_legal_moves_for_piece(s.game, s.players, position))
+                    before = json.dumps(s.snapshot(), sort_keys=True)
+                    if not expected:
+                        with self.assertRaises(EngineError):
+                            act(s, "uproot_tree", at=list(position))
+                        self.assertEqual(before, json.dumps(s.snapshot(), sort_keys=True))
+                        continue
+                    carried = s.game.get_piece(original)
+                    act(s, "uproot_tree", at=list(position))
+                    self.assertFalse(s.game.get_piece(position).rooted)
+                    self.assertEqual(s.game.get_piece(position).owner, other)
+                    self.assertIn(corner, s.game.expanded_corners)
+                    self.assertIs(s.game.get_piece(shifted), carried)
+                    self.assertIsNone(s.game.get_piece(original))
+                    if ap == 2:
+                        self.assertEqual(s.game.current_player, other)
+                        self.assertEqual(s.turn_number, 2)
+                    else:
+                        self.assertEqual(s.game.current_ap, ap - 2)
+                        self.assertEqual(s.game.current_player, side)
+
     def test_enemy_plant_requires_both_own_animals_two_ap_and_marker(self):
         for kinds, ap, marked, expected in (
             ((), 5, True, False),
@@ -139,7 +179,7 @@ class G2Tests(unittest.TestCase):
                     self.assertEqual(s.game.current_ap, ap - 2)
                     self.assertTrue(s.game.get_piece((6, 3)).rooted)
                     self.assertEqual(s.game.get_piece((6, 3)).owner, "white")
-                    self.assertNotIn("uproot_tree", {a["type"] for a in s.legal_actions() if a["params"].get("at") == [6, 3]})
+                    self.assertIn("uproot_tree", {a["type"] for a in s.legal_actions() if a["params"].get("at") == [6, 3]})
                 else:
                     with self.assertRaises(EngineError):
                         act(s, "plant_tree", at=[6, 3])

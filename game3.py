@@ -74,7 +74,11 @@ def can_start_extra_turn(board, position):
 
 def get_g3_condition_results(playerstate, board):
     turn = board.g3_turn
+    start_matches = matches_pattern(turn.start_positions, START_PATTERN)
+    end_positions = own_positions(board)
+    # A qualifying start anchors the ending orientation; translation remains free.
+    end_matches = (normalized(end_positions) == normalized({(-x, -y) for x, y in turn.start_positions})
+                   if start_matches else matches_pattern(end_positions, END_PATTERN))
     return [board.time_token_owner in {"black", "white"} and board.time_token_owner != board.current_player,
             turn.move_count == 1, not turn.resources_changed,
-            matches_pattern(turn.start_positions, START_PATTERN),
-            matches_pattern(own_positions(board), END_PATTERN)]
+            start_matches, end_matches]

@@ -15,6 +15,26 @@ class LocalSettingsTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "CheckMate" / "settings.json"
 
+    def test_prompt_defaults_and_multiline_round_trip(self):
+        from agent_prompts import DEFAULT_PROMPTS
+        store = LocalSettings(self.path)
+        preferences = store.load()
+        self.assertEqual(preferences["prompts"], DEFAULT_PROMPTS)
+        custom = "中文行动提示词\n" + "长文本 " * 1500
+        preferences["prompts"]["system_prompt"] = custom
+        store.save(preferences)
+        self.assertEqual(LocalSettings(self.path).load()["prompts"]["system_prompt"], custom)
+        self.assertEqual(DEFAULT_PROMPTS["system_prompt"][:8], "You play")
+
+    def test_invalid_prompt_values_fall_back_without_losing_valid_ones(self):
+        from agent_prompts import DEFAULT_PROMPTS
+        store = LocalSettings(self.path)
+        store.save({"prompts": {"system_prompt": " ", "notes_prompt": "中文复盘\n完整替换", "ng_plus_prompt": []}})
+        prompts = store.load()["prompts"]
+        self.assertEqual(prompts["system_prompt"], DEFAULT_PROMPTS["system_prompt"])
+        self.assertEqual(prompts["ng_plus_prompt"], DEFAULT_PROMPTS["ng_plus_prompt"])
+        self.assertEqual(prompts["notes_prompt"], "中文复盘\n完整替换")
+
     def test_windows_location_uses_user_directory_not_package(self):
         with patch("local_settings.sys.platform", "win32"), patch.dict(
             "os.environ", {"LOCALAPPDATA": str(Path(self.directory.name) / "Local")}
@@ -27,7 +47,19 @@ class LocalSettingsTests(unittest.TestCase):
         self.assertFalse(preferences["agent_play_mode"])
         self.assertEqual(preferences["player_types"], {"black": "human", "white": "llm"})
         self.assertEqual(preferences["play_control_mode"], "step")
+        self.assertTrue(all(profile["max_tokens"] == 32768 for profile in preferences["api_profiles"].values()))
         self.assertFalse(self.path.parent.exists())
+
+    def test_streaming_defaults_for_older_profiles_and_round_trips_per_side(self):
+        self.path.parent.mkdir()
+        self.path.write_text(json.dumps({"api_profiles": {"black": {"model": "legacy"}}}))
+        preferences = LocalSettings(self.path).load()
+        self.assertTrue(preferences["api_profiles"]["black"]["streaming"])
+        preferences["api_profiles"]["black"]["streaming"] = False
+        LocalSettings(self.path).save(preferences)
+        restored = LocalSettings(self.path).load()
+        self.assertFalse(restored["api_profiles"]["black"]["streaming"])
+        self.assertTrue(restored["api_profiles"]["white"]["streaming"])
 
     def test_round_trip_and_unchanged_preferences_skip_disk_write(self):
         store = LocalSettings(self.path)

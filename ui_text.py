@@ -88,9 +88,15 @@ def load_failed(error: Exception | str) -> str:
     return f"{LOAD_FAILED_PREFIX}: {error}"
 
 
-def selected_piece(kind: str) -> str:
-    # A piece has been selected.
-    return f"Selected {kind}. Choose a target."
+def selected_piece(kind: str, can_move=True, can_sell=False, ability=None) -> str:
+    options = []
+    if can_move:
+        options.append("choose a highlighted destination to move")
+    if can_sell:
+        options.append(f"click the {kind.capitalize()} shop button to sell")
+    if ability:
+        options.append(f"click this piece again to {ability}")
+    return f"Selected {kind}: " + "; or ".join(options) + ". Right-click to cancel."
 
 
 def turn_started(player: str) -> str:
@@ -132,8 +138,8 @@ def time_wish_prompt(winner: str, token_owner: str | None) -> str:
     # Check victory prompt before the time-token holder spends the token.
     owner = token_owner.capitalize() if token_owner in {"black", "white"} else "Time token holder"
     return (
-        f"{winner.capitalize()} wins, but is this truly the end? "
-        f"{owner}, spend the time token and make your wish."
+        f"{winner.capitalize()} wins. Human control: click the {owner} player panel "
+        "to make the time wish and destroy the time token. This unlocks New Game+."
     )
 
 
@@ -151,7 +157,7 @@ def choose_cost(kind: str, selected: int, required: int) -> str:
 
 def choose_refund(remaining: int) -> str:
     # Refund placement after selling a special piece.
-    return f"Choose refund cells. {remaining} squirrel(s) remaining."
+    return f"Choose empty cells for {remaining} refunded squirrel(s). The sold piece's cell is available. Right-click to cancel the sale."
 
 
 def condition_tooltip(result: bool | None) -> str:
@@ -241,6 +247,7 @@ def piece_tooltip(piece: Any, owner_label: str, can_lion_control: bool, is_new: 
                 f"{owner_label} rooted tree",
                 "Cannot move or be removed. Counts as one piece.",
                 "Its owner can select, then click again to uproot for 1 AP. No mole needed.",
+                "With an own lion, select an enemy tree and click again to uproot for 2 AP.",
             ])
         else:
             lines.extend([
@@ -281,10 +288,12 @@ def resource_button_tooltip(resource_id: str, context: dict[str, Any]) -> str:
         if context.get("any_player_over_piece_limit"):
             lines.append("Unavailable while a player has more than 7 pieces.")
         if ap > 0:
-            if ap % 2 == 1:
-                lines.append("With odd AP, the token ends with the opponent.")
+            holder = context.get("time_token_owner")
+            if holder in {"black", "white"}:
+                destination = ("white" if holder == "black" else "black") if ap % 2 else holder
+                lines.append(f"After spending {ap} AP, {destination.capitalize()} will hold the token.")
             else:
-                lines.append("With even AP, the token stays with its current holder.")
+                lines.append("Unavailable: this game has no time token.")
     return tooltip_lines(lines)
 
 

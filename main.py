@@ -28,7 +28,8 @@ from llm_usage import LLMUsage
 from local_settings import LocalSettings, default_profile
 from settings_widgets import NUMERIC_SETTINGS, read_clipboard, write_clipboard
 from agent_play import AgentPlayController, ConnectionTester
-from agent_prompts import SYSTEM_PROMPT
+from agent_prompts import SYSTEM_PROMPT, NOTES_PROMPT, NG_PLUS_PROMPT
+from note_review import NoteReviewer
 from gameengine import (
     GameSession,
     PHASE_CHECKING_WIN,
@@ -44,7 +45,7 @@ from gameengine import (
     PHASE_TIME_WISH,
     monotonic_ms,
 )
-from gui import CheckMateGui, FPS
+from gui import CheckMateGui, FPS, LEGAL_HINT_COLOR, LLM_LEGAL_HINT_COLOR
 from sl_func import SAVES_DIR, list_save_slots, load_game, save_game
 
 
@@ -142,8 +143,10 @@ class CheckMateApp:
         self.gui.play_control_mode = preferences["play_control_mode"]
         self.gui.player_types = preferences["player_types"]
         self.gui.api_profiles = preferences["api_profiles"]
+        self.gui.prompts = preferences["prompts"]
         self.agent_play = AgentPlayController(self)
         self.connection_tester = ConnectionTester(self)
+        self.note_reviewer = NoteReviewer(self)
         self.configure_save_policy()
         if self.local_settings.error:
             self.state.menu_dialog = self.local_settings.error
@@ -160,6 +163,7 @@ class CheckMateApp:
             self.refresh_save_slots()
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
+                    self.note_reviewer.cancel()
                     self.agent_play.stop()
                     self.connection_tester.cancel()
                     self.autosave()
@@ -168,6 +172,7 @@ class CheckMateApp:
                 if self.handle_setting_event(event):
                     continue
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    self.note_reviewer.cancel()
                     self.agent_play.stop()
                     self.connection_tester.cancel()
                     self.autosave()
@@ -184,6 +189,7 @@ class CheckMateApp:
 
             self.update_victory_check()
             self.update_setting_repeat()
+            self.note_reviewer.tick()
             self.agent_play.tick()
             self.connection_tester.tick()
             self.sync_play_controls()
@@ -248,6 +254,10 @@ class CheckMateApp:
 
     def handle_setting_event(self, event):
         gui, editor = self.gui, self.gui.setting_editor
+        if gui.handle_scrollbar_event(event):
+            return True
+        if gui.thinking_turn_editing and gui.handle_thinking_turn_event(event):
+            return True
         if event.type == pygame.WINDOWFOCUSLOST:
             self.setting_repeat = None
             editor.dragging = False
@@ -315,7 +325,7 @@ class CheckMateApp:
                 modifiers = getattr(event, "mod", 0)
                 self.handle_setting_key(event.key, modifiers)
                 if gui.active_setting and event.key in {pygame.K_BACKSPACE, pygame.K_DELETE, pygame.K_LEFT,
-                                                        pygame.K_RIGHT, pygame.K_HOME, pygame.K_END}:
+                                                        pygame.K_RIGHT, pygame.K_HOME, pygame.K_END, pygame.K_UP, pygame.K_DOWN}:
                     self.setting_repeat = (event.key, modifiers, pygame.time.get_ticks() + 350)
                 return True
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and editor.dragging:
@@ -324,11 +334,11 @@ class CheckMateApp:
             if event.type == pygame.MOUSEMOTION and editor.dragging:
                 rect = self.active_setting_rect()
                 if rect:
-                    editor.set_cursor(gui.setting_cursor_at(rect, event.pos[0]), extend=True)
+                    editor.set_cursor(self.setting_cursor_at(rect, event.pos), extend=True)
                 return True
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and clicked == gui.active_setting:
                 rect = self.active_setting_rect()
-                editor.set_cursor(gui.setting_cursor_at(rect, event.pos[0]), bool(pygame.key.get_mods() & pygame.KMOD_SHIFT))
+                editor.set_cursor(self.setting_cursor_at(rect, event.pos), bool(pygame.key.get_mods() & pygame.KMOD_SHIFT))
                 editor.dragging = True
                 return True
         if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
@@ -347,14 +357,19 @@ class CheckMateApp:
             return False
         if clicked == "next":
             self.handle_play_control(clicked)
-        elif clicked == "system_prompt":
-            gui.system_prompt_expanded = not gui.system_prompt_expanded
-        elif clicked == "copy_system_prompt":
+        elif clicked in {"system_prompt", "notes_prompt", "ng_plus_prompt"}:
+            attribute = clicked + "_expanded"
+            setattr(gui, attribute, not getattr(gui, attribute))
+        elif clicked in {"copy_system_prompt", "copy_notes_prompt", "copy_ng_plus_prompt"}:
             try:
-                write_clipboard(SYSTEM_PROMPT)
-                gui.settings_error = "System prompt copied."
+                write_clipboard(gui.prompts[clicked.removeprefix("copy_")])
+                gui.settings_error = "Prompt copied."
             except (OSError, pygame.error, UnicodeError):
                 gui.settings_error = "Clipboard unavailable; try again."
+        elif clicked in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}:
+            self.focus_setting(clicked)
+            editor.set_cursor(self.setting_cursor_at(self.active_setting_rect(), event.pos))
+            editor.dragging = True
         elif gui.dropdown_values(clicked):
             gui.setting_dropdown = clicked
             gui.dropdown_index = gui.dropdown_values(clicked).index(self.setting_value(clicked))
@@ -371,7 +386,7 @@ class CheckMateApp:
             self.sync_play_controls()
         else:
             _, side, key = clicked.split(":")
-            if key == "vision":
+            if key in {"vision", "streaming"}:
                 gui.api_profiles[side][key] = not gui.api_profiles[side][key]
                 self.apply_settings()
             else:
@@ -381,6 +396,8 @@ class CheckMateApp:
         return True
 
     def setting_value(self, name):
+        if name in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}:
+            return self.gui.prompts[name.removesuffix("_text")]
         if name == "play_control_mode":
             return self.gui.play_control_mode
         if name.startswith("player:"):
@@ -416,14 +433,22 @@ class CheckMateApp:
         return next((self.gui.setting_input_rect(name, rect) for name, _, _, rect in self.gui.settings_layout()
                      if name == self.gui.active_setting), None)
 
+    def setting_cursor_at(self, rect, position):
+        if self.gui.setting_editor.multiline:
+            return self.gui.prompt_cursor_at(rect, position)
+        return self.gui.setting_cursor_at(rect, position[0])
+
     def focus_setting(self, name):
         self.gui.active_setting = name
+        self.gui.setting_editor.multiline = name in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}
         value = self.setting_value(name)
         self.gui.setting_editor.load("" if value is None else str(value))
         self.gui.settings_error = ""
         self.setting_repeat = None
         pygame.key.start_text_input()
         pygame.key.set_text_input_rect(self.active_setting_rect())
+        if self.gui.setting_editor.multiline:
+            self.gui.settings_error = "Enter: newline | Ctrl+Enter: save | Esc: cancel"
 
     def close_setting_editor(self):
         self.gui.active_setting = None
@@ -438,11 +463,14 @@ class CheckMateApp:
         if key == pygame.K_ESCAPE:
             self.close_setting_editor()
         elif key in {pygame.K_RETURN, pygame.K_KP_ENTER}:
-            self.commit_setting()
+            if editor.multiline and not control:
+                editor.insert("\n")
+            else:
+                self.commit_setting()
         elif key == pygame.K_TAB:
             current = self.gui.active_setting
             fields = [name for name, _, _ in self.gui.settings_rows() if name.startswith("field:")
-                      and not self.gui.dropdown_values(name) and not name.endswith(":vision")]
+                      and not self.gui.dropdown_values(name) and name.split(":")[-1] not in {"vision", "streaming"}]
             if self.commit_setting() and current in fields:
                 target = fields[(fields.index(current) + (-1 if shift else 1)) % len(fields)]
                 self.focus_setting(target)
@@ -471,8 +499,22 @@ class CheckMateApp:
             editor.delete(backward=key == pygame.K_BACKSPACE, word=control)
         elif key in {pygame.K_LEFT, pygame.K_RIGHT}:
             editor.move(-1 if key == pygame.K_LEFT else 1, extend=shift, word=control)
+        elif editor.multiline and key in {pygame.K_UP, pygame.K_DOWN, pygame.K_HOME, pygame.K_END}:
+            rect = self.active_setting_rect()
+            spans = self.gui.prompt_spans(editor.text, rect.w - 20)
+            row = self.gui.prompt_cursor_row(spans)
+            start, end = spans[row]
+            if key in {pygame.K_HOME, pygame.K_END}:
+                target = (0 if key == pygame.K_HOME else len(editor.text)) if control else (start if key == pygame.K_HOME else end)
+            else:
+                target_row = max(0, min(len(spans)-1, row + (-1 if key == pygame.K_UP else 1)))
+                x = rect.x + 10 + self.gui.exposure_font.size(editor.text[start:editor.cursor])[0]
+                y = rect.y + 10 + target_row * (self.gui.exposure_font.get_linesize() + 3)
+                target = self.gui.prompt_cursor_at(rect, (x, y))
+            editor.set_cursor(target, extend=shift)
         elif key in {pygame.K_HOME, pygame.K_END}:
             editor.set_cursor(0 if key == pygame.K_HOME else len(editor.text), extend=shift)
+        self.gui.ensure_prompt_cursor_visible()
 
     def update_setting_repeat(self, now=None):
         if self.setting_repeat is None or not self.gui.active_setting:
@@ -489,17 +531,29 @@ class CheckMateApp:
             return
         if name == "stop":
             self.connection_tester.cancel(reset=False)
+            self.note_reviewer.cancel()
         session = self.state.session
         if session is not None and session.flow.phase == PHASE_CHOOSE_TOKEN:
             self.set_dialog("Initial time-token placement is human only. Finish it before starting LLM play.")
-        elif name != "next" or self.agent_play.side_to_play() is not None:
+        elif name != "next" or self.agent_play.side_to_play() is not None or self.note_reviewer.busy:
             getattr(self.agent_play, name)()
         self.sync_play_controls()
 
     def edit_setting_text(self, text):
         self.gui.setting_editor.insert(text)
+        self.gui.ensure_prompt_cursor_visible()
 
     def commit_setting(self):
+        if self.gui.setting_editor.multiline:
+            name = self.gui.active_setting.removesuffix("_text")
+            value = self.gui.setting_buffer
+            if not value.strip():
+                self.gui.settings_error = "Prompt cannot be empty; enter text or press Esc."
+                return False
+            self.gui.prompts[name] = value
+            self.close_setting_editor()
+            self.save_local_settings()
+            return True
         _, side, field = self.gui.active_setting.split(":")
         value = self.gui.setting_buffer.strip()
         try:
@@ -527,18 +581,27 @@ class CheckMateApp:
         self.save_policy.configure(self.gui.agent_play_mode and bool(colors), colors or ("white",))
 
     def apply_settings(self):
+        self.note_reviewer.cancel()
         self.agent_play.stop()
         self.connection_tester.cancel()
         self.configure_save_policy()
         self.bind_agent_tools()
-        try:
-            self.local_settings.save({key: getattr(self.gui, key) for key in (
-                "agent_play_mode", "llm_color", "play_control_mode", "player_types", "api_profiles")})
-        except OSError:
-            self.gui.settings_error = "Settings active; local save failed."
+        if self.state.session is not None:
+            self.state.session.refresh_selection_message()
+            self.state.session.interaction.reset_tooltip_text("")
+        self.save_local_settings()
         self.sync_play_controls()
 
+    def save_local_settings(self):
+        try:
+            self.local_settings.save({key: getattr(self.gui, key) for key in (
+                "agent_play_mode", "llm_color", "play_control_mode", "player_types", "api_profiles", "prompts")})
+        except OSError:
+            self.gui.settings_error = "Settings active; local save failed."
+
     def sync_play_controls(self):
+        self.gui.legal_hint_color = (
+            LLM_LEGAL_HINT_COLOR if self.agent_play.side_to_play() is not None else LEGAL_HINT_COLOR)
         self.gui.play_state = self.agent_play.state
         self.gui.play_message = self.agent_play.message
         self.gui.play_received = self.agent_play.received
@@ -547,6 +610,11 @@ class CheckMateApp:
         session = self.state.session
         if session and session.flow.phase == PHASE_CHOOSE_TOKEN:
             self.gui.play_message = "Initial token: human only"
+        elif self.note_reviewer.busy:
+            self.gui.play_message = "Notes review paused" if self.agent_play.paused else "Updating condition notes"
+            self.gui.play_can_start = self.agent_play.paused
+        elif session and session.flow.phase == PHASE_TIME_WISH:
+            self.gui.play_message = "Time wish: human only"
 
     def configure_agent_play_mode(self, enabled, llm_color="white"):
         if llm_color not in {"black", "white"}:
@@ -578,12 +646,10 @@ class CheckMateApp:
 
     def refresh_exposure_notes(self):
         session = self.state.session
-        notes = session.agent_notes.get(self.gui.llm_color, "") if session else ""
+        notes = session.agent_notes if session else {}
         winner = session.result()["winner"] if session else None
-        if winner is not None:
-            notes += ("\n\n" if notes else "") + session.llm_usage.game_summary_text(winner)
-        if self.gui.exposure_panes["notes"].text != notes:
-            self.gui.set_exposure_content(notes=notes)
+        summary = session.llm_usage.game_summary_text(winner) if winner is not None else ""
+        self.gui.set_side_notes(notes, summary)
 
     def begin_llm_request(self, request_id, side):
         """API-controller hook: call at dispatch, retaining the returned game anchor."""
@@ -598,30 +664,55 @@ class CheckMateApp:
         session.llm_usage.begin_request(request_id, side, session.turn_number if is_turn else None)
         return session
 
-    def complete_llm_request(self, session, request_id, *, reasoning="", reply="", usage=None, status="completed"):
+    def complete_llm_request(self, session, request_id, *, reasoning="", reply="", usage=None, status="completed", turn=None):
         """API-controller hook: receive output/usage before executing its plan."""
         if session is not self.state.session:
             return False
         if not session.llm_usage.finish_request(request_id, usage, status):
             return False
+        self.show_llm_request(session, request_id, reasoning, reply, status, final=True, turn=turn)
+        self.refresh_exposure_notes()
+        return True
+
+    def update_llm_request(self, session, request_id, *, reasoning="", reply="", turn=None):
+        """Update one live request bubble without recording usage or saving."""
+        if session is not self.state.session:
+            return False
+        try:
+            if session.llm_usage.request_info(request_id)["status"] != "pending":
+                return False
+        except KeyError:
+            return False
+        self.show_llm_request(session, request_id, reasoning, reply, "receiving", final=False, turn=turn)
+        return True
+
+    def show_llm_request(self, session, request_id, reasoning, reply, status, *, final, turn=None):
         entry = session.llm_usage.request_info(request_id)
         number = session.llm_usage.requests.index(entry) + 1
+        previous = next((message.get("turn") for message in self.gui.exposure_panes["thinking"].messages
+                         if message.get("request_id") == request_id), None)
+        display_turn = turn or entry.get("turn") or previous or session.turn_number
         lines = [f"Request {number} | {entry['side'].capitalize()} | {status.capitalize()}"]
+        lines.append(f"Turn {display_turn}")
+        if entry.get("purpose") == "notes":
+            lines.append("Condition Notes Review")
         if reasoning:
             lines.extend(["Reasoning", str(reasoning)])
         if reply:
             lines.extend(["Reply", str(reply)])
-        def token(key):
-            return str(entry[key]) if entry[key] is not None else "Not reported"
-        lines.append(f"Tokens: input {token('input_tokens')} | output {token('output_tokens')} | total {token('total_tokens')}")
+        if final:
+            def token(key):
+                return str(entry[key]) if entry[key] is not None else "Not reported"
+            lines.append(f"Tokens: input {token('input_tokens')} | output {token('output_tokens')} | total {token('total_tokens')}")
         self.gui.append_exposure_output("\n".join(lines),
-                                        color=(235, 74, 72) if status == "failed" else None,
-                                        side=entry["side"] if status == "completed" else None)
-        self.refresh_exposure_notes()
-        return True
+                                        color=(235, 74, 72) if status in {"failed", "stopped"} else None,
+                                        side=entry["side"] if status in {"completed", "receiving"} else None,
+                                        request_id=request_id, turn=display_turn)
 
     def report_agent_notice(self, text):
-        self.gui.append_exposure_output("Notice | " + text, color=(235, 74, 72))
+        session = self.state.session
+        self.gui.append_exposure_output("Notice | " + text, color=(235, 74, 72),
+                                        turn=session.turn_number if session else None)
 
     def call_agent_tool(self, name, arguments=None):
         """Main-thread entry for the future API controller, bound to this board."""
@@ -762,6 +853,7 @@ class CheckMateApp:
         self.start_game(3)
 
     def start_game(self, gamemode: int) -> None:
+        self.note_reviewer.cancel()
         self.connection_tester.cancel()
         self.agent_play.stop(reset=True)
         self.state.session = GameSession.new_game(
@@ -818,6 +910,7 @@ class CheckMateApp:
             session_id="human",
             resolve_checks_immediately=False,
         )
+        self.note_reviewer.cancel()
         self.agent_play.stop(reset=True)
         self.state.session = session
         self.connection_tester.cancel()
@@ -867,8 +960,10 @@ class CheckMateApp:
         self.checking_started_at = 0
         self.condition_animation_done = True
         if session.is_over():
-            session.set_message(ui_text.GAME_OVER_DIALOG)
+            session.set_message(ui_text.NEW_GAME_PLUS_HINT if session.can_start_new_game_plus() else ui_text.GAME_OVER_DIALOG)
             return
+        if session.flow.phase == PHASE_TIME_WISH:
+            session.set_message(ui_text.time_wish_prompt(session.flow.time_wish_winner, session.game.time_token_owner))
         if session.game is not None and session.flow.phase == PHASE_CHOOSE_TOKEN:
             session.set_message(ui_text.LOADED_CHOOSE_TOKEN_DIALOG)
 
@@ -921,6 +1016,8 @@ class CheckMateApp:
         if session is None or session.game is None:
             return set(), set(), set()
         game = session.game
+        llm_turn = self.agent_play.side_to_play() is not None
+        self.gui.legal_hint_color = LLM_LEGAL_HINT_COLOR if llm_turn else LEGAL_HINT_COLOR
         phase = session.flow.phase
         if phase == PHASE_CHOOSE_TOKEN:
             return set(), set(), {"black", "white"}
@@ -933,6 +1030,10 @@ class CheckMateApp:
         camp_targets: set[str] = set()
         for action in actions:
             params = action["params"]
+            if llm_turn and action["type"] in {
+                    "place_squirrel", "buy_elephant", "buy_lion", "buy_mole", "buy_butterfly",
+                    "sell_elephant", "sell_lion", "sell_mole", "sell_butterfly"} and params.get("at"):
+                board_targets.add(tuple(params["at"]))
             if action["type"] in {"select_piece", "uproot_tree", "plant_tree", "butterfly_extra_turn",
                                   "remove_piece_limit", "place_elephant_bonus", "place_refund", "select_cost"} and params.get("at"):
                 board_targets.add(tuple(params["at"]))
@@ -1072,6 +1173,7 @@ class CheckMateApp:
                 and selected_piece.kind == "lion"
             ),
             "current_player_has_token": game is not None and game.time_token_owner == game.current_player,
+            "time_token_owner": game.time_token_owner if game is not None else None,
             "any_player_over_piece_limit": (
                 session is not None
                 and any(player.num_pieces > 7 for player in session.players.values())

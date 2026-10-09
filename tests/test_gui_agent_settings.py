@@ -142,7 +142,7 @@ class AgentSettingsGuiTests(unittest.TestCase):
         self.assertEqual(previous.call("get_gi_rules")["code"], "stale_game")
         self.app.load_from_file(path.name)
         self.assertEqual(self.app.call_agent_tool("get_notes")["notes"], "My saved hypothesis")
-        self.assertEqual(self.app.gui.exposure_panes["notes"].text, "My saved hypothesis")
+        self.assertIn("My saved hypothesis", self.app.gui.exposure_panes["notes"].text)
         self.assertEqual(self.app.state.session.action_log, [])
 
     def test_human_checkpoint_waits_for_visible_check_animation(self):
@@ -198,7 +198,7 @@ class AgentSettingsGuiTests(unittest.TestCase):
         self.app.after_engine_change()
         self.app.call_agent_tool("update_notes", {"text": "My final notes"})
         notes = self.app.gui.exposure_panes["notes"].text
-        self.assertTrue(notes.startswith("My final notes\n\nGame Summary"))
+        self.assertIn("My final notes\n\nGame Summary", notes)
         self.assertIn("Winner: Black", notes)
         self.assertIn("Average/request: 50.0", notes)
 
@@ -486,14 +486,32 @@ class AgentSettingsGuiTests(unittest.TestCase):
             return request
         self.app.connection_tester = ConnectionTester(self.app, factory)
         names = [name for name, _, _ in self.app.gui.settings_rows()]
-        self.assertEqual(names[names.index("field:black:model") + 1], "test:black")
+        self.assertEqual(names[names.index("field:black:model") + 1:names.index("field:black:model") + 3],
+                         ["field:black:streaming", "test:black"])
         button = self.show_setting("test:black")
         self.app.handle_setting_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=button.center))
         self.assertEqual(self.app.gui.connection_status["black"], "running")
         self.assertNotIn("tools", requests[0].payload)
         self.assertNotIn("board", str(requests[0].payload))
+        self.assertTrue(requests[0].payload["stream"])
+        requests[0].response = {"event": "progress", "reasoning": "Testing", "reply": "O"}
+        self.app.connection_tester.tick()
+        self.assertEqual(self.app.gui.connection_status["black"], "running")
         requests[0].response = response(content="OK")
         self.app.connection_tester.tick()
+        self.assertEqual(self.app.gui.connection_status["black"], "running")
+        job = self.app.connection_tester.jobs["black"]
+        requests[-1].response = response(("connection_echo", {"nonce": job["nonce"]}))
+        self.app.connection_tester.tick()
+        self.assertEqual(requests[-1].payload["messages"][1]["reasoning_content"], "Provider-returned reasoning")
+        requests[-1].response = response(content=job["receipt"])
+        self.app.connection_tester.tick()
+        if self.app.gui.api_profiles["black"]["vision"]:
+            content = requests[-1].payload["messages"][0]["content"]
+            self.assertNotIn(job["color"], content[0]["text"])
+            self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+            requests[-1].response = response(content=job["color"])
+            self.app.connection_tester.tick()
         self.assertEqual(self.app.gui.connection_status["black"], "success")
         pane = self.app.gui.exposure_panes["thinking"]
         self.assertIn("Connection Test | Black | Success", pane.text)
@@ -507,15 +525,82 @@ class AgentSettingsGuiTests(unittest.TestCase):
         self.assertEqual(self.app.gui.connection_status["black"], "failed")
         self.assertIn("HTTP 401", pane.messages[-1]["text"])
         self.assertIsNone(pane.messages[-1]["color"])
+        while self.app.connection_tester.jobs:
+            requests[-1].response = {"error": "API returned HTTP 401. Invalid API key."}
+            self.app.connection_tester.tick()
         self.app.connection_tester.start("black")
         self.app.apply_settings()
         self.assertTrue(requests[-1].cancelled)
         self.assertEqual(self.app.gui.connection_status["black"], "idle")
 
+    def test_streaming_click_switch_is_per_side_and_persists_locally(self):
+        import pygame
+        from local_settings import LocalSettings
+        self.app.configure_agent_play_mode(True, "black")
+        self.app.gui.player_types["white"] = "llm"
+        rows = [name for name, _, _ in self.app.gui.settings_rows()]
+        for side in ("black", "white"):
+            model = rows.index("field:" + side + ":model")
+            self.assertEqual(rows[model + 1:model + 3], ["field:" + side + ":streaming", "test:" + side])
+        button = self.show_setting("field:black:streaming")
+        self.app.handle_setting_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=button.center))
+        self.assertFalse(self.app.gui.api_profiles["black"]["streaming"])
+        self.assertTrue(self.app.gui.api_profiles["white"]["streaming"])
+        self.assertIsNone(self.app.gui.active_setting)
+        self.assertEqual(self.app.gui.dropdown_values("field:black:streaming"), ())
+        restored = LocalSettings(self.path / "settings.json").load()
+        self.assertFalse(restored["api_profiles"]["black"]["streaming"])
+
+    def test_partial_updates_replace_one_bubble_follow_tail_and_never_save(self):
+        from unittest.mock import patch
+        self.app.configure_agent_play_mode(True, "black")
+        self.start()
+        session = self.app.begin_llm_request("stream-bubble", "black")
+        pane = self.app.gui.exposure_panes["thinking"]
+        with patch.object(self.app, "persist") as save:
+            for number in range(2):
+                self.assertTrue(self.app.update_llm_request(session, "stream-bubble",
+                    reasoning="中文 reasoning 🦋\n" * (60 + number)))
+            save.assert_not_called()
+        self.assertEqual(len(pane.messages), 1)
+        self.assertEqual(pane.messages[0]["side"], "black")
+        self.assertGreater(pane.scroll, 0)
+        self.assertEqual(session.llm_usage.requests[0]["status"], "pending")
+        self.assertNotIn("Tokens:", pane.text)
+        pane.scroll = 0
+        self.app.update_llm_request(session, "stream-bubble", reasoning="中文 reasoning 🦋\n" * 65)
+        self.assertEqual(pane.scroll, 0)
+        self.app.complete_llm_request(session, "stream-bubble", reasoning="Final reasoning", reply="Final reply",
+                                      usage={"prompt_tokens": 20, "completion_tokens": 11, "total_tokens": 31})
+        self.assertEqual(len(pane.messages), 1)
+        self.assertIn("total 31", pane.text)
+        self.assertIn("Completed", pane.text)
+        self.assertFalse(self.app.update_llm_request(session, "stream-bubble", reply="Late progress"))
+        self.assertEqual(len(session.llm_usage.requests), 1)
+        self.app.gui.set_exposure_content(thinking="")
+        self.assertTrue(self.app.update_llm_request(self.app.begin_llm_request("stopped-stream", "white"),
+                                                   "stopped-stream", reasoning="Partial"))
+        self.app.complete_llm_request(session, "stopped-stream", status="stopped", reasoning="Partial")
+        self.assertIsNone(pane.messages[0]["side"])
+        self.assertEqual(pane.messages[0]["color"], (235, 74, 72))
+
+    def test_incremental_bubble_wrapping_matches_full_text_across_chunks_and_resize(self):
+        gui = self.app.gui
+        text = "中文🦋 and word fragments\n" + "a" * 100 + "  spaces\n" + "last line " * 20
+        entry = {"text": "", "side": "black", "color": None}
+        for width in (170, 95):
+            entry.clear()
+            entry.update(text="", side="black", color=None)
+            for end in range(1, len(text) + 1, 7):
+                entry["text"] = text[:end]
+                self.assertEqual(gui.chat_entry_lines(entry, width), gui.wrap_chat_suffix(text[:end], width)[0])
+            entry["text"] = text
+            self.assertEqual(gui.chat_entry_lines(entry, width + 15), gui.wrap_chat_suffix(text, width + 15)[0])
+
     def test_numeric_defaults_reset_all_three_fields(self):
         import pygame
         self.app.configure_agent_play_mode(True, "black")
-        for key, changed, default in (("max_tokens", 32768, 4096), ("timeout", 300, 120), ("temperature", 0.8, None)):
+        for key, changed, default in (("max_tokens", 8192, 32768), ("timeout", 300, 120), ("temperature", 0.8, None)):
             self.app.gui.api_profiles["black"][key] = changed
             self.show_setting("field:black:" + key)
             button = self.app.gui.setting_controls()["default:black:" + key]
@@ -547,6 +632,74 @@ class AgentSettingsGuiTests(unittest.TestCase):
         self.app.gui.draw_sidebars()
         self.app.start_game(2)
         self.assertEqual(pane.messages, [])
+
+    def test_thinking_bubbles_match_side_background_and_text(self):
+        import pygame
+        gui = self.app.gui
+        body = pygame.Rect(0, 0, 320, 400)
+        pane = gui.exposure_panes["thinking"]
+        pane.scroll = 0
+        for side, background, foreground in (("black", (5, 5, 7), (245, 245, 245)),
+                                             ("white", (245, 245, 242), (20, 20, 22))):
+            entry = {"rect": pygame.Rect(0, 0, 300, 80), "side": side,
+                     "padding": 10, "lines": ["Side notes"], "color": None}
+            with patch.object(gui, "chat_layout", return_value=([entry], 3)):
+                gui.draw_chat_messages(body, pane)
+            self.assertEqual(tuple(gui.window.get_at((150, 65)))[:3], background)
+            colors = {tuple(gui.window.get_at((x, y)))[:3]
+                      for y in range(10, 45) for x in range(10, 160)}
+            self.assertIn(foreground, colors)
+
+    def test_prompt_editor_grows_preserves_newlines_and_saves_without_stopping(self):
+        import pygame
+        self.app.configure_agent_play_mode(True, "black")
+        gui = self.app.gui
+        field = self.show_setting("system_prompt_text")
+        self.app.handle_setting_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=field.center))
+        self.app.handle_setting_event(pygame.event.Event(pygame.MOUSEBUTTONUP, button=1, pos=field.center))
+        self.assertEqual(gui.active_setting, "system_prompt_text")
+        self.app.handle_setting_key(pygame.K_a, pygame.KMOD_CTRL)
+        self.app.edit_setting_text("中文行动提示词")
+        short_height = gui.setting_row_height("system_prompt_text", gui.settings_body())
+        self.app.handle_setting_key(pygame.K_RETURN, 0)
+        self.app.edit_setting_text("第二行，执行已有笔记中的实验。\n" * 40)
+        value = gui.setting_buffer
+        self.assertIn("\n", value)
+        self.assertGreater(gui.setting_row_height("system_prompt_text", gui.settings_body()), short_height)
+        gui.draw_sidebars()
+        with patch.object(self.app.agent_play, "stop") as stop:
+            self.app.handle_setting_key(pygame.K_RETURN, pygame.KMOD_CTRL)
+            stop.assert_not_called()
+        self.assertIsNone(gui.active_setting)
+        self.assertEqual(gui.prompts["system_prompt"], value)
+        self.assertEqual(self.app.local_settings.load()["prompts"]["system_prompt"], value)
+        button = self.show_setting("copy_system_prompt")
+        with patch("main.write_clipboard") as write:
+            self.app.handle_setting_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=button.center))
+            write.assert_called_once_with(value)
+
+    def test_prompt_editor_cancel_blank_validation_and_mouse_caret(self):
+        import pygame
+        self.app.configure_agent_play_mode(True, "black")
+        gui = self.app.gui
+        original = gui.prompts["notes_prompt"]
+        self.app.focus_setting("notes_prompt_text")
+        gui.setting_editor.select_all()
+        self.app.edit_setting_text("甲乙\n丙丁")
+        rect = self.app.active_setting_rect()
+        line_height = gui.exposure_font.get_linesize() + 3
+        self.assertEqual(gui.prompt_cursor_at(rect, (rect.x + 10, rect.y + 10 + line_height)), 3)
+        self.app.handle_setting_key(pygame.K_HOME, 0)
+        self.assertEqual(gui.setting_cursor, 3)
+        self.app.handle_setting_key(pygame.K_UP, 0)
+        self.assertEqual(gui.setting_cursor, 0)
+        self.app.handle_setting_key(pygame.K_a, pygame.KMOD_CTRL)
+        self.app.handle_setting_key(pygame.K_BACKSPACE, 0)
+        self.assertFalse(self.app.commit_setting())
+        self.assertEqual(gui.prompts["notes_prompt"], original)
+        self.app.handle_setting_key(pygame.K_ESCAPE, 0)
+        self.assertIsNone(gui.active_setting)
+        self.assertEqual(gui.prompts["notes_prompt"], original)
 
     def test_system_prompt_preview_matches_sent_text_and_viewing_does_not_stop_play(self):
         import pygame
@@ -581,6 +734,78 @@ class AgentSettingsGuiTests(unittest.TestCase):
         gui.draw_sidebars()
         gui.agent_play_mode = False
         self.assertEqual(gui.settings_rows(), [("agent_play_mode", "Agent Play Mode", "Off")])
+
+    def test_notes_prompt_preview_copy_and_no_ap_label(self):
+        import pygame
+        from agent_prompts import NOTES_PROMPT
+        self.app.configure_agent_play_mode(True, "black")
+        gui = self.app.gui
+        rows = {name: (title, value) for name, title, value in gui.settings_rows()}
+        self.assertEqual(rows["notes_prompt_text"][1], NOTES_PROMPT)
+        self.assertEqual(rows["field:black:timeout"][0], "break when no AP cost (s)")
+        for width in (120, 240, 400):
+            self.assertEqual(" ".join(gui.system_prompt_lines(width, NOTES_PROMPT)), NOTES_PROMPT)
+        with patch.object(self.app.agent_play, "stop") as stop:
+            header = self.show_setting("notes_prompt")
+            self.app.handle_setting_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=header.center))
+            self.assertFalse(gui.notes_prompt_expanded)
+            header = self.show_setting("notes_prompt")
+            self.app.handle_setting_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=header.center))
+            button = self.show_setting("copy_notes_prompt")
+            with patch("main.write_clipboard") as write:
+                self.app.handle_setting_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=button.center))
+                write.assert_called_once_with(NOTES_PROMPT)
+            stop.assert_not_called()
+        gui.draw_sidebars()
+
+    def test_next_can_resume_queued_review_during_human_time_wish(self):
+        self.start()
+        session = self.app.state.session
+        session.flow.phase = "time_wish"
+        session.flow.time_wish_winner = "black"
+        self.app.gui.agent_play_mode = True
+        self.app.agent_play.pause()
+        self.app.note_reviewer.queue.append((session, "black", {}))
+        self.app.sync_play_controls()
+        self.assertTrue(self.app.gui.play_can_start)
+        self.app.handle_play_control("next")
+        self.assertFalse(self.app.agent_play.paused)
+        self.assertEqual(session.flow.phase, "time_wish")
+
+    def test_notes_pages_preserve_side_scroll_and_update_independently(self):
+        import pygame
+        self.start()
+        session = self.app.state.session
+        session.agent_notes = {"black": "Black hypothesis", "white": "White hypothesis"}
+        self.app.refresh_exposure_notes()
+        gui = self.app.gui
+        pane = gui.exposure_panes["notes"]
+        self.assertEqual(gui.notes_side, "black")
+        self.assertEqual(pane.text, "Black hypothesis")
+        self.assertEqual(pane.messages, [])
+        pane.scroll = 2
+        controls = gui.notes_page_controls()
+        self.assertTrue(gui.handle_sidebar_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=controls["next"].center)))
+        self.assertEqual(gui.notes_side, "white")
+        self.assertEqual(pane.text, "White hypothesis")
+        self.assertEqual(pane.scroll, 0)
+        pane.scroll = 3
+        session.agent_notes["black"] = "Revised black hypothesis"
+        self.app.refresh_exposure_notes()
+        self.assertEqual(pane.text, "White hypothesis")
+        self.assertEqual(pane.scroll, 3)
+        gui.select_notes_side("black")
+        self.assertEqual(pane.scroll, 2)
+        self.assertEqual(pane.text, "Revised black hypothesis")
+        gui.draw_exposure_panes()
+        body = gui.exposure_body(gui.exposure_pane_rects()["notes"])
+        self.assertEqual(tuple(gui.window.get_at((body.right-2, body.bottom-2)))[:3], (5,5,7))
+        gui.select_notes_side("white")
+        gui.draw_exposure_panes()
+        self.assertEqual(tuple(gui.window.get_at((body.right-2, body.bottom-2)))[:3], (245,245,242))
+        self.app.start_game(2)
+        self.assertNotIn("hypothesis", pane.text)
+        self.assertEqual(gui.notes_scroll_positions, {})
 
 
 if __name__ == "__main__":

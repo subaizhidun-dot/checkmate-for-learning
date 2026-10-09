@@ -233,6 +233,44 @@ class G2GuiTests(unittest.TestCase):
             self.assertEqual(color == (231, 47, 44), piece is None)
             self.assertIn((2, 3), game.tree_markers)
 
+    def test_enemy_rooted_tree_double_click_uproots_with_lion(self):
+        from basicgame import Resource
+        self.start_ready()
+        game = self.app.state.game
+        game.set_piece((4, 2), Resource("black", "lion"))
+        self.app.state.session.refresh_players()
+        self.app.gui.resize_window((780, 650))
+        self.render()
+        self.assertIn((6, 3), self.app.get_legal_targets()[0])
+        before = game.current_ap
+        self.click("board:6,3")
+        self.assertIn("uproot the tree", self.app.state.session.pending_message)
+        self.click("board:6,3")
+        self.assertFalse(game.get_piece((6, 3)).rooted)
+        self.assertEqual(game.get_piece((6, 3)).owner, "white")
+        self.assertEqual(game.current_ap, before - 2)
+        self.assertIn("upper_right", game.expanded_corners)
+        self.render()
+        self.assertIn("board:6,0", {r.name for r in self.app.gui.click_regions})
+        self.assertNotIn("board:6,1", {r.name for r in self.app.gui.click_regions})
+
+    def test_rooted_tree_backgrounds_are_solid_and_uprooted_arrows_remain(self):
+        self.start_ready()
+        renderer = self.app.gui
+        self.render()
+        for side, position, color, arrow in (("black", (2, 3), (0, 0, 0), (255, 255, 255)),
+                                             ("white", (6, 3), (255, 255, 255), (29, 29, 29))):
+            with self.subTest(side=side):
+                rect = renderer.rect_for_logical_cell(*position)
+                for point in ((rect.centerx, rect.top + 6), (rect.centerx, rect.bottom - 7),
+                              (rect.left + 6, rect.centery), (rect.right - 7, rect.centery)):
+                    self.assertEqual(tuple(renderer.screen.get_at(point)[:3]), color)
+                renderer.draw_piece(rect, side, "tree", rooted=True)
+                for dx, dy in ((6, 6), (rect.w - 7, 6), (6, rect.h - 7), (rect.w - 7, rect.h - 7)):
+                    self.assertEqual(tuple(renderer.screen.get_at((rect.x + dx, rect.y + dy))[:3]), color)
+                renderer.draw_piece(rect, side, "tree", rooted=False)
+                self.assertEqual(tuple(renderer.screen.get_at((rect.x + 6, rect.y + 6))[:3]), arrow)
+
     def test_enemy_tree_double_click_plants_with_own_lion_and_mole(self):
         from basicgame import Resource
         self.start_ready()

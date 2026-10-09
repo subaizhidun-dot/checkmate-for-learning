@@ -36,6 +36,11 @@ FLOW_FIELDS = (
     "pending_refund_kind",
     "time_wish_winner",
     "checking_action_message",
+    "last_public_check",
+    "public_check_archive",
+    "turn_start_board",
+    "turn_actions",
+    "agent_intents",
 )
 
 
@@ -324,6 +329,8 @@ def serialize_flow(flow: Any | None) -> dict[str, Any]:
         for position, piece in getattr(flow, "temp_removed", [])
     ]
     result["temp_placed"] = [list(position) for position in getattr(flow, "temp_placed", [])]
+    new_pieces = getattr(flow, "temp_new_pieces", None)
+    result["temp_new_pieces"] = None if new_pieces is None else [list(pos) for pos in new_pieces]
     return result
 
 
@@ -373,12 +380,16 @@ def deserialize_flow(data: dict[str, Any] | None) -> Any:
     except TypeError:  # pragma: no cover - defensive
         allowed = set(FLOW_FIELDS)
     kwargs: dict[str, Any] = {key: value for key, value in values.items() if key in allowed}
+    kwargs["public_check_archive"] = values.get("public_check_archive") or (
+        [values["last_public_check"]] if values.get("last_public_check") else [])
     kwargs["temp_removed"] = [
         (tuple(item["position"]), deserialize_resource(item.get("piece")))
         for item in values.get("temp_removed", [])
         if item.get("position") is not None and item.get("piece") is not None
     ]
     kwargs["temp_placed"] = [tuple(pos) for pos in values.get("temp_placed", [])]
+    new_pieces = values.get("temp_new_pieces")
+    kwargs["temp_new_pieces"] = None if new_pieces is None else [tuple(pos) for pos in new_pieces]
     for key in ("pending_refund_count",):
         if key in kwargs and kwargs[key] is None:
             kwargs[key] = 0

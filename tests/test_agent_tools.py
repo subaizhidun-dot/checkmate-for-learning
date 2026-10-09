@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agenttools import AgentTools, TOOLS
+from basicgame import Resource
 from gameengine import GameSession, encode_action_id, save_session_file, load_session_file
 
 
@@ -18,6 +19,99 @@ def playing(mode=3):
 
 
 class AgentToolTests(unittest.TestCase):
+    def test_direct_move_selects_and_moves_once_and_retries_without_spending_ap(self):
+        session = playing()
+        tools = AgentTools(session, "black")
+        self.assertIn({"source": [2, 1], "target": [3, 1], "ap": 1}, tools.get_legal_actions()["moves"])
+        args = {"source": [2, 1], "target": [3, 1], "revision": session.revision, "request_id": "move-1"}
+        result = tools.call("move_piece", args)
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["executed"]), 2)
+        self.assertNotIn("state", result)
+        self.assertNotIn("board", json.dumps(result))
+        self.assertEqual(result["revision_before"], args["revision"])
+        self.assertEqual(result["revision_after"], session.revision)
+        self.assertEqual(result["current_ap"], 4)
+        self.assertEqual(result["stop_reason"], "completed")
+        self.assertEqual(session.game.current_ap, 4)
+        self.assertEqual(session.flow.phase, "playing")
+        self.assertIsNone(session.interaction.selected_pos)
+        after = session.snapshot()
+        self.assertTrue(tools.call("move_piece", args)["replayed"])
+        self.assertEqual(session.snapshot(), after)
+        self.assertNotIn("g3_turn", json.dumps(result))
+        self.assertEqual(tools.call("move_piece", {**args, "target": [4, 1]})["code"], "request_conflict")
+
+    def test_invalid_direct_move_does_not_leave_a_selection_or_change_board(self):
+        session = playing()
+        tools = AgentTools(session, "black")
+        before = session.snapshot()
+        for target in ([8, 6], [3, 2], [True, 1], [3]):
+            result = tools.call("move_piece", {"source": [2, 1], "target": target,
+                                              "revision": session.revision, "request_id": "invalid"})
+            self.assertFalse(result["ok"])
+            self.assertEqual(session.snapshot(), before)
+        self.assertEqual(tools.call("move_piece", {"source": [2, 1], "target": [3, 1],
+                                                   "revision": -1, "request_id": "stale"})["code"], "revision_mismatch")
+        self.assertEqual(session.snapshot(), before)
+
+    def test_direct_move_handles_existing_selection_and_elephant_bonus(self):
+        session = playing()
+        tools = AgentTools(session, "black")
+        tools.apply_action("select_piece:at=2,3", session.revision)
+        result = tools.call("move_piece", {"source": [2, 3], "target": [3, 3],
+                                          "revision": session.revision, "request_id": "elephant"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["executed"]), 1)
+        self.assertEqual(session.flow.phase, "pending_elephant_bonus")
+        self.assertEqual(session.game.current_ap, 4)
+        self.assertEqual(tools.get_legal_actions()["moves"], [])
+
+    def test_direct_move_respects_lion_control_and_new_piece_restrictions(self):
+        session = playing()
+        session.game.set_piece((4, 3), Resource("white", "squirrel"))
+        session.game.set_piece((4, 4), Resource("black", "lion"))
+        session.game.mark_new_piece((2, 1))
+        session.refresh_players()
+        tools = AgentTools(session, "black")
+        legal = tools.get_legal_actions()["moves"]
+        self.assertFalse(any(move["source"] == [2, 1] for move in legal))
+        self.assertIn({"source": [4, 3], "target": [5, 3], "ap": 2}, legal)
+        result = tools.call("move_piece", {"source": [4, 3], "target": [5, 3],
+                                          "revision": session.revision, "request_id": "controlled"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(session.game.current_ap, 3)
+        self.assertEqual(session.game.get_piece((5, 3)).owner, "white")
+
+    def test_direct_move_is_unavailable_during_human_phases_or_other_side(self):
+        session = GameSession.new_game(2)
+        tools = AgentTools(session, "black")
+        args = {"source": [2, 1], "target": [3, 1], "revision": session.revision, "request_id": "blocked"}
+        self.assertFalse(tools.call("move_piece", args)["ok"])
+        session.flow.phase = "time_wish"
+        self.assertEqual(tools.call("move_piece", args)["code"], "human_only_phase")
+        session = playing()
+        self.assertEqual(AgentTools(session, "white").get_legal_actions()["moves"], [])
+        self.assertEqual(AgentTools(session, "white").call("move_piece", args)["code"], "awaiting_other_side")
+
+    def test_time_wish_is_hidden_and_rejected_by_model_tools(self):
+        for mode in (2, 3):
+            session = playing(mode)
+            session.flow.phase = "time_wish"
+            session.flow.time_wish_winner = "white"
+            for side in ("black", "white"):
+                tools = AgentTools(session, side)
+                before = session.snapshot()
+                self.assertEqual(tools.call("get_legal_actions")["actions"], [])
+                self.assertEqual(tools.call("apply_action", {
+                    "action_id": "time_wish:side=black", "revision": session.revision,
+                })["code"], "human_only_phase")
+                self.assertEqual(tools.call("submit_plan", {
+                    "actions": [{"type": "time_wish", "params": {"side": "black"}}],
+                    "revision": session.revision, "request_id": "wish",
+                })["code"], "human_only_phase")
+                self.assertEqual(session.snapshot(), before)
+
     def test_queries_do_not_evaluate_victory_or_expose_internal_records(self):
         for mode in (1, 2, 3):
             session = playing(mode)
@@ -82,7 +176,9 @@ class AgentToolTests(unittest.TestCase):
         from agent_prompts import NG_PLUS_NOTES
         for mode in (1, 2, 3):
             source = playing()
-            source.end_session("mate", loser="white")
+            source.flow.phase = "time_wish"
+            source.flow.time_wish_winner = "white"
+            source.select_camp("black")
             session = GameSession.new_game(mode, previous_session=source)
             self.assertIsNone(session.game.time_token_owner)
             for side in ("black", "white"):
@@ -110,6 +206,9 @@ class AgentToolTests(unittest.TestCase):
         result = tools.call("submit_plan", args)
         self.assertEqual(len(result["executed"]), 2)
         self.assertEqual(result["stop_reason"], "illegal_action")
+        self.assertNotIn("state", result)
+        self.assertEqual(result["revision_before"], revision)
+        self.assertEqual(result["revision_after"], session.revision)
         self.assertNotIn("g3_turn", json.dumps(result))
         self.assertIsNone(session.game.get_piece((2, 1)))
         self.assertIsNotNone(session.game.get_piece((3, 1)))
