@@ -35,6 +35,8 @@ class NoteReviewer:
             self.session, self.seen = session, 0
         if session is None:
             return
+        self.queue = deque(job for job in self.queue
+                           if job[0] is session and not session.note_review_locks[job[1]])
         events = session.public_check_events[self.seen:]
         self.seen = len(session.public_check_events)
         if session.result()["winner"] is not None:
@@ -46,7 +48,7 @@ class NoteReviewer:
             if not self.eligible(session, event):
                 continue
             for side, kind in self.app.gui.player_types.items():
-                if kind == "llm":
+                if kind == "llm" and not session.note_review_locks[side]:
                     self.queue.append((session, side, deepcopy(event)))
 
     def tick(self):
@@ -78,6 +80,8 @@ class NoteReviewer:
         if session is not self.app.state.session or not self.app.gui.agent_play_mode:
             return
         if not self.eligible(session, event):
+            return
+        if session.note_review_locks[side]:
             return
         tools = self.app.agent_tools_by_side.get(side)
         if tools is None:
@@ -114,6 +118,7 @@ class NoteReviewer:
         session.llm_usage.begin_request(request_id, side, purpose="notes")
         self.active = {"session": session, "side": side, "tools": tools, "event": event,
                        "profile": profile, "id": request_id, "old_notes": old_notes,
+                       "notes_version": session.notes_versions[side],
                        "reasoning": "", "reply": "", "started": time.monotonic(), "displayed": 0}
         try:
             completion_url(profile["endpoint"])
@@ -148,7 +153,10 @@ class NoteReviewer:
                         or not isinstance(arguments["text"], str) or not arguments["text"].strip()
                         or len(arguments["text"]) > 12000):
                     raise ValueError("Invalid replacement notes")
-                if job["session"].agent_notes.get(job["side"]) != job["old_notes"]:
+                if job["session"].note_review_locks[job["side"]]:
+                    raise ValueError("Notes review is locked; retained the current notes")
+                if (job["session"].notes_versions[job["side"]] != job["notes_version"]
+                        or job["session"].agent_notes.get(job["side"]) != job["old_notes"]):
                     raise ValueError("Notes changed while reviewing; retained the newer notes")
                 result = job["tools"].call("update_notes", arguments)
                 if not result.get("ok"):

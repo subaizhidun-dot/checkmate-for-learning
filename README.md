@@ -105,6 +105,8 @@ The save-slot list is cached and refreshed after saves/loads or when opening the
 - A headless engine shared by the window and the agent interface, with revisioned actions, request de-duplication, structured errors and an action log.
 - Pixel-art animal/resource icons and G1 rule diagrams.
 
+**Current Notes** provides a pencil button for editing the selected side's condition notes. Enter inserts a newline; Ctrl+Enter, the checkmark button or clicking outside saves; Esc cancels. Mouse selection and Ctrl+A/C/X/V support Unicode and multiline text, up to 12,000 characters. Black and White have independent open/closed lock icons. A closed lock skips that side's scheduled hypothesis-check and notes-update reviews while action requests continue to read its notes. Unlocking resumes reviews at future eligible checks. Queued reviews for a locked side are removed, and an in-flight review cannot overwrite notes subsequently edited or locked. Notes and locks belong to the game save; new games start unlocked and legacy saves default to unlocked. Player edits preserve board revision and existing action requests. Program-owned usage statistics remain outside the editor.
+
 ## Game 2
 
 Choose **Start > Start G2**. G2 starts with two squirrels and one rooted tree per side on the central 5x5 board. The outer pinecones are removed.
@@ -141,8 +143,6 @@ From a qualifying position, choose **Start G1+**, **Start G2+** or **Start G3+**
 The user completes the G2/G3 time wish regardless of either side's Human/LLM configuration. Completing a wish displays `Save this game, then start New Game+.` Save the terminal position through the regular Save menu, then use New Game+ to select a mode.
 
 Saves store the deciding player and action phase, so playing without a token resumes directly after loading. Initial token selection remains a distinct saved phase. No additional NG+ identity or unlock field is required; saves from older versions that lack a phase get an initial phase inferred on loading.
-
-Run rule checks with `python -m unittest discover -s tests -v`.
 
 New saves are written completely before replacing the destination file. After a successful write, older JSON files belonging to the same slot are removed. Saves are created locally in `saves/` when needed.
 
@@ -281,20 +281,10 @@ Guarantees worth relying on:
   action at all (for example a full board). No rule is invented for it: end the
   session with `end_game` and a reason chosen by the caller.
 
-## Repository contents
 
-See [GITHUB_UPLOAD.md](GITHUB_UPLOAD.md) for the current upload manifest and handoff notes.
-
-The repository contains source code, dependency information, documentation, rule checks and the 19 images currently loaded by `gui.py`. G2 number cards, G3 condition cards and full-square directional tiles are drawn at runtime. Local environments, editor settings, saved games, logs, generated previews, artwork backups, the machine-specific launcher and unused artwork are excluded through `.gitignore`.
-
-Mole and tree-state artwork is included for G2; a transparent golden butterfly sprite is included for G3.
-
-To distribute the runnable source, include the 24 root-level Python modules, `pic/`'s 19 tracked PNGs and `requirements.txt`. Keep their relative locations unchanged. `README.md` and `tests/` provide documentation and regression checks; they are not needed to launch the game. Personal Set preferences live outside the project and must not be copied into a distribution.
-
-`requirements.txt` pins the tested Pygame version, `pygame==2.6.1`. HTTP/API requests, configuration, saves and the agent worker use the Python standard library, so no additional API SDK or agent framework is required. Temporary screenshots and review scripts can be removed without affecting play or the regression suite. Unique original-art backups remain local and ignored.
 
 ## AI assistance
 
-The original project declaration is consolidated here: GPT-6 Astra and GPT-6.1 Sol, developed by OpenAI and used through Codex, assisted with implementation discussions, data storage, project structure, framework setup, translation of comments and visible interface text from Chinese into English, complex functions and code-level testing. The project author takes responsibility for the submitted work.
+Use GPT-6 Astra and GPT-6.1 Sol, developed by OpenAI and used through Codex, assisted with implementation discussions, data storage, project structure, framework setup, translation of comments and visible interface text from Chinese into English, complex functions and code-level testing. The project author takes responsibility for the submitted work.
 
 Further development has used AI assistance through Codex for code changes, documentation and verification. Updated pixel-art assets and rule diagrams were generated or edited with OpenAI image-generation tools. This remains a learning project and should be reviewed against the intended game rules when extended.

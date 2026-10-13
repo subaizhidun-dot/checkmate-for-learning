@@ -165,7 +165,9 @@ class AgentTools:
     def update_notes(self, text):
         if not isinstance(text, str) or len(text) > 12000:
             raise ValueError("Invalid notes")
-        self.session.agent_notes[self.color] = text
+        if self.session.note_review_locks[self.color]:
+            return {"ok": False, "code": "notes_locked", "message": "Notes review is locked for this side."}
+        self.session.set_notes(self.color, text)
         return {"ok": True, "notes": text}
 
     def apply_action(self, action_id, revision, request_id=None):

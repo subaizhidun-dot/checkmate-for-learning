@@ -35,8 +35,13 @@ class AutosavePolicy:
             # Over-limit decisions and wishes are not the start of a human turn.
             if self._llm_turn_pending and session.flow.phase != "playing":
                 return False
-        return self._saved != (session, session.revision, session.flow.phase, session.llm_usage.revision)
+        return self._saved != self.signature(session)
+
+    @staticmethod
+    def signature(session):
+        return (session, session.revision, session.flow.phase, session.llm_usage.revision,
+                tuple(session.notes_versions[side] for side in ("black", "white")))
 
     def mark_saved(self, session):
-        self._saved = (session, session.revision, session.flow.phase, session.llm_usage.revision)
+        self._saved = self.signature(session)
         self._llm_turn_pending = False
