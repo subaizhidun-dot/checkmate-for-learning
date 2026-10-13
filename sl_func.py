@@ -67,6 +67,7 @@ def save_game(
     finished: bool | None = None,
     message: str | None = None,
     agent_notes: dict[str, str] | None = None,
+    note_review_locks: dict[str, bool] | None = None,
     llm_stats: dict[str, Any] | None = None,
     turn_number: int = 1,
 ) -> Path:
@@ -107,6 +108,7 @@ def save_game(
         "finished": finished,
         "message": message,
         "agent_notes": agent_notes or {},
+        "note_review_locks": {side: (note_review_locks or {}).get(side) is True for side in ("black", "white")},
         "llm_stats": llm_stats or {},
         "turn_number": turn_number,
     }
@@ -211,6 +213,9 @@ def load_game(path: str | Path) -> dict[str, Any]:
             flow_data["phase"] = "choose_token"
 
     players = deserialize_players(data.get("players", {}), board)
+    note_review_locks = data.get("note_review_locks")
+    if not isinstance(note_review_locks, dict):
+        note_review_locks = {}
     return {
         "game": game,
         "players": players,
@@ -226,6 +231,8 @@ def load_game(path: str | Path) -> dict[str, Any]:
         "message": data.get("message"),
         "agent_notes": {color: text for color, text in (data.get("agent_notes") or {}).items()
                         if color in {"black", "white"} and isinstance(text, str)},
+        "note_review_locks": {side: note_review_locks.get(side) is True
+                              for side in ("black", "white")},
         "llm_stats": data.get("llm_stats") or {},
         "turn_number": data.get("turn_number") or 1,
     }

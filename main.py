@@ -227,6 +227,7 @@ class CheckMateApp:
             session_id=session.session_id,
             revision=session.revision,
             agent_notes=session.agent_notes,
+            note_review_locks=session.note_review_locks,
             llm_stats=session.llm_usage.to_dict(),
             turn_number=session.turn_number,
             game_over_reason=session.game_over_reason,
@@ -269,15 +270,25 @@ class CheckMateApp:
         if event.type == pygame.KEYUP and self.setting_repeat and event.key == self.setting_repeat[0]:
             self.setting_repeat = None
             return True
-        if not gui.agent_play_mode:
+        if not gui.agent_play_mode and not gui.editing_player_notes:
             self.close_setting_editor()
             gui.setting_dropdown = None
         controls = gui.setting_controls()
         clicked = None
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             clicked = next((name for name, rect in controls.items() if rect.collidepoint(event.pos)), None)
+            notes_controls = gui.notes_page_controls()
+            note_control = next((name for name, rect in notes_controls.items() if rect.collidepoint(event.pos)), None)
+            if note_control in {"edit", "lock"}:
+                clicked = "notes:" + note_control
+            elif gui.editing_player_notes:
+                note_rect = gui.exposure_pane_rects().get("notes")
+                if note_rect and gui.exposure_body(note_rect).collidepoint(event.pos):
+                    clicked = gui.active_setting
             over_dropdown = any(rect.collidepoint(event.pos) for rect in gui.dropdown_controls().values())
             if clicked == "agent_play_mode" and not over_dropdown:
+                if gui.editing_player_notes and not self.commit_setting():
+                    return True
                 self.close_setting_editor()
                 gui.setting_dropdown = gui.drag_setting_slider = None
                 gui.agent_play_mode = not gui.agent_play_mode
@@ -345,6 +356,23 @@ class CheckMateApp:
                 return True
         if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
             return False
+        if clicked in {"notes:edit", "notes:lock"}:
+            session = self.state.session
+            if session is None:
+                return True
+            was_editing = gui.editing_player_notes
+            if gui.active_setting and not self.commit_setting():
+                return True
+            side = gui.notes_side
+            if clicked == "notes:lock":
+                session.set_note_review_lock(side, not session.note_review_locks[side])
+                self.note_reviewer.collect()
+                self.refresh_exposure_notes()
+                self.persist()
+            elif not was_editing:
+                self.focus_setting("player_notes:" + side)
+                gui.ensure_prompt_cursor_visible()
+            return True
         if clicked and clicked.startswith("default:"):
             self.close_setting_editor()
             _, side, key = clicked.split(":")
@@ -407,6 +435,8 @@ class CheckMateApp:
         return True
 
     def setting_value(self, name):
+        if name.startswith("player_notes:"):
+            return self.state.session.agent_notes.get(name.split(":")[1], "")
         if name in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}:
             return self.gui.prompts[name.removesuffix("_text")]
         if name == "play_control_mode":
@@ -441,6 +471,8 @@ class CheckMateApp:
         self.gui.api_profiles[side][key] = round(value, 2) if key == "temperature" else int(value)
 
     def active_setting_rect(self):
+        if self.gui.editing_player_notes:
+            return self.gui.notes_editor_rect()
         return next((self.gui.setting_input_rect(name, rect) for name, _, _, rect in self.gui.settings_layout()
                      if name == self.gui.active_setting), None)
 
@@ -452,7 +484,9 @@ class CheckMateApp:
     def focus_setting(self, name):
         self.gui.thinking_selection.focused = self.gui.thinking_selection.dragging = False
         self.gui.active_setting = name
-        self.gui.setting_editor.multiline = name in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}
+        self.gui.end_thinking_turn_edit()
+        self.gui.setting_editor.multiline = self.gui.editing_player_notes or name in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}
+        self.notes_edit_session = self.state.session if self.gui.editing_player_notes else None
         value = self.setting_value(name)
         self.gui.setting_editor.load("" if value is None else str(value))
         self.gui.settings_error = ""
@@ -463,11 +497,14 @@ class CheckMateApp:
             self.gui.settings_error = "Enter: newline | Ctrl+Enter: save | Esc: cancel"
 
     def close_setting_editor(self):
+        was_notes = self.gui.editing_player_notes
         self.gui.active_setting = None
         self.gui.setting_editor.dragging = False
         self.gui.settings_error = ""
         self.setting_repeat = None
         pygame.key.stop_text_input()
+        if was_notes:
+            self.refresh_exposure_notes()
 
     def handle_setting_key(self, key, modifiers):
         editor = self.gui.setting_editor
@@ -476,7 +513,7 @@ class CheckMateApp:
             self.close_setting_editor()
         elif key in {pygame.K_RETURN, pygame.K_KP_ENTER}:
             if editor.multiline and not control:
-                editor.insert("\n")
+                self.edit_setting_text("\n")
             else:
                 self.commit_setting()
         elif key == pygame.K_TAB:
@@ -500,7 +537,7 @@ class CheckMateApp:
                 if key == pygame.K_v:
                     pasted = read_clipboard()
                     if pasted:
-                        editor.insert(pasted)
+                        self.edit_setting_text(pasted)
                 elif editor.selected_text():
                     write_clipboard(editor.selected_text())
                     if key == pygame.K_x:
@@ -513,6 +550,8 @@ class CheckMateApp:
             editor.move(-1 if key == pygame.K_LEFT else 1, extend=shift, word=control)
         elif editor.multiline and key in {pygame.K_UP, pygame.K_DOWN, pygame.K_HOME, pygame.K_END}:
             rect = self.active_setting_rect()
+            if rect is None:
+                return
             spans = self.gui.prompt_spans(editor.text, rect.w - 20)
             row = self.gui.prompt_cursor_row(spans)
             start, end = spans[row]
@@ -552,10 +591,29 @@ class CheckMateApp:
         self.sync_play_controls()
 
     def edit_setting_text(self, text):
+        if self.gui.editing_player_notes:
+            start, end = self.gui.setting_editor.selection
+            normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+            if len(self.gui.setting_buffer) - end + start + len(normalized) > 12000:
+                self.gui.settings_error = "Notes exceed 12000 characters; shorten the text or press Esc."
+                return
         self.gui.setting_editor.insert(text)
         self.gui.ensure_prompt_cursor_visible()
 
     def commit_setting(self):
+        if self.gui.editing_player_notes:
+            if self.notes_edit_session is not self.state.session:
+                self.close_setting_editor()
+                return True
+            try:
+                self.state.session.set_notes(self.gui.active_setting.split(":")[1], self.gui.setting_buffer)
+            except ValueError:
+                self.gui.settings_error = "Notes exceed 12000 characters; shorten the text or press Esc."
+                return False
+            self.close_setting_editor()
+            self.refresh_exposure_notes()
+            self.persist()
+            return True
         if self.gui.setting_editor.multiline:
             name = self.gui.active_setting.removesuffix("_text")
             value = self.gui.setting_buffer
@@ -661,7 +719,8 @@ class CheckMateApp:
         notes = session.agent_notes if session else {}
         winner = session.result()["winner"] if session else None
         summary = session.llm_usage.game_summary_text(winner) if winner is not None else ""
-        self.gui.set_side_notes(notes, summary)
+        self.gui.set_side_notes(notes, summary, session.note_review_locks if session else None,
+                                editable=session is not None)
 
     def begin_llm_request(self, request_id, side):
         """API-controller hook: call at dispatch, retaining the returned game anchor."""
@@ -905,6 +964,7 @@ class CheckMateApp:
             finished=session.finished,
             message=session.pending_message,
             agent_notes=session.agent_notes,
+            note_review_locks=session.note_review_locks,
             llm_stats=session.llm_usage.to_dict(),
             turn_number=session.turn_number,
         )
@@ -940,6 +1000,7 @@ class CheckMateApp:
         session.request_cache = {}
         session.action_log = []
         session.agent_notes = loaded.get("agent_notes") or {}
+        session.note_review_locks = loaded["note_review_locks"]
         session.llm_usage = LLMUsage.from_dict(loaded.get("llm_stats"))
         session.turn_number = max(1, int(loaded.get("turn_number") or 1))
         session.game_over_reason = loaded.get("game_over_reason")

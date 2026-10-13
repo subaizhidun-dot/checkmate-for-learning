@@ -13,7 +13,7 @@ SYSTEM_PROMPT = (
     "and predicted condition results. record_intent only records predictions and never executes them. "
     "Use actual action tools to execute a recorded plan. Tool results return automatically while the decision is unfinished. "
     "Continue or revise that plan as needed. "
-    "Condition notes are updated only by a separate review after public feedback. No hidden victory formula is available. "
+    "Condition notes can be edited by the player or updated by a separate review after public feedback. No hidden victory formula is available. "
     "Tool results accompany the next permitted request so you can continue the same decision. "
     "The latest user context contains the authoritative board, AP, phase, revision, pending operations and legal actions. "
     "Read-tool context_key receipts refer to that context or the public_rules in the stable system prefix. "

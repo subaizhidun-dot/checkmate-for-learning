@@ -230,6 +230,8 @@ class GameSession:
         self.request_cache: dict[str, dict[str, Any]] = {}
         self.action_log: list[ActionLogEntry] = []
         self.agent_notes: dict[str, str] = {}
+        self.note_review_locks = {"black": False, "white": False}
+        self.notes_versions = {"black": 0, "white": 0}
         self.public_check_events: list[dict] = []
         self.llm_usage = LLMUsage()
         self.turn_number = 1
@@ -305,6 +307,20 @@ class GameSession:
             return
         for player in self.players.values():
             player.refresh_side(self.game)
+
+    def set_notes(self, side: str, text: str) -> None:
+        if side not in {"black", "white"} or not isinstance(text, str) or len(text) > 12000:
+            raise ValueError("Invalid condition notes")
+        if self.agent_notes.get(side) != text:
+            self.agent_notes[side] = text
+            self.notes_versions[side] += 1
+
+    def set_note_review_lock(self, side: str, locked: bool) -> None:
+        if side not in {"black", "white"} or type(locked) is not bool:
+            raise ValueError("Invalid notes review lock")
+        if self.note_review_locks[side] != locked:
+            self.note_review_locks[side] = locked
+            self.notes_versions[side] += 1
 
     @classmethod
     def new_g3(cls, session_id=None, agent_color=None, resolve_checks_immediately=True):
@@ -1862,6 +1878,7 @@ def load_session_file(path: str | Path, session_id: str | None = None, **kwargs:
     session.action_log = []
     session.game_over_reason = loaded.get("game_over_reason")
     session.agent_notes = loaded.get("agent_notes") or {}
+    session.note_review_locks = loaded["note_review_locks"]
     session.llm_usage = LLMUsage.from_dict(loaded.get("llm_stats"))
     session.turn_number = max(1, int(loaded.get("turn_number") or 1))
     session.finished = bool(loaded.get("finished", False))
@@ -1888,6 +1905,7 @@ def save_session_file(session: GameSession, path: str | Path | None = None) -> P
         session_id=session.session_id,
         revision=session.revision,
         agent_notes=session.agent_notes,
+        note_review_locks=session.note_review_locks,
         llm_stats=session.llm_usage.to_dict(),
         turn_number=session.turn_number,
         game_over_reason=session.game_over_reason,

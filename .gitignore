@@ -4,15 +4,56 @@ venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+*.egg-info/
 
-# Local editor settings, saves, logs, and generated previews
+# Editor and operating-system metadata
 .idea/
 .vscode/
-saves/
-output/
+.vs/
+.fleet/
+*.code-workspace
+*.iml
+*.ipr
+*.iws
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+.Rproj.user/
+/.Rhistory
+/.RData
+/.Ruserdata
+
+# Local game state, build output and generated previews
+/saves/
+/output/
+/build/
+/dist/
 *.log
 *.tmp
-checkmate.exe
+/checkmate.exe
+/GITHUB_UPLOAD.md
+
+# Local regression tests and reports
+/tests/
+/test/
+/test_*.py
+/*_test.py
+/conftest.py
+/pytest.ini
+/.coveragerc
+/test-results/
+/htmlcov/
+/coverage/
+.coverage
+.coverage.*
+coverage.xml
 
 # Local credentials and configuration
 .env

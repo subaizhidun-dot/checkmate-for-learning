@@ -126,6 +126,8 @@ class CheckMateGui:
         self.thinking_turn = None
         self.notes_side = "black"
         self.notes_by_side = {}
+        self.note_review_locks = {"black": False, "white": False}
+        self.notes_editable = False
         self.notes_summary = ""
         self.notes_scroll_positions = {}
         self.notes_page_initialized = False
@@ -741,6 +743,8 @@ class CheckMateGui:
             self.window.blit(label, label.get_rect(center=(x, rect.bottom - 11)))
 
     def prompt_text(self, name):
+        if name.startswith("player_notes:"):
+            return self.setting_editor.text if self.active_setting == name else self.notes_by_side.get(name.split(":")[1], "")
         return self.setting_editor.text if self.active_setting == name else self.prompts[name.removesuffix("_text")]
 
     def prompt_spans(self, text, width):
@@ -780,6 +784,23 @@ class CheckMateGui:
 
     def ensure_prompt_cursor_visible(self):
         name = self.active_setting
+        if self.editing_player_notes:
+            pane = self.exposure_panes["notes"]
+            rect = self.exposure_pane_rects().get("notes")
+            if rect is None:
+                return
+            body = self.exposure_body(rect)
+            spans = self.prompt_spans(self.setting_editor.text, body.w)
+            row = self.prompt_cursor_row(spans)
+            height = self.exposure_font.get_linesize() + 3
+            visible = max(1, body.h // height)
+            pane.scroll = max(0, min(pane.scroll, row))
+            if row >= pane.scroll + visible:
+                pane.scroll = row - visible + 1
+            x = body.x + self.exposure_font.size(self.setting_editor.text[spans[row][0]:self.setting_editor.cursor])[0]
+            pygame.key.set_text_input_rect(pygame.Rect(x, body.y + (row-pane.scroll)*height, 2, height))
+            self.refresh_notes_page()
+            return
         if name not in {"system_prompt_text", "notes_prompt_text", "ng_plus_prompt_text"}:
             return
         rect = next(rect for item, _, _, rect in self.settings_layout() if item == name)
@@ -796,12 +817,12 @@ class CheckMateGui:
         x = rect.x + 10 + self.exposure_font.size(self.setting_editor.text[start:self.setting_editor.cursor])[0]
         pygame.key.set_text_input_rect(pygame.Rect(x, max(body.top, min(y, body.bottom - height)), 2, height))
 
-    def draw_prompt_editor(self, name, rect):
+    def draw_prompt_editor(self, name, rect, *, background=(21, 23, 26), color=(224, 225, 229)):
         active = self.active_setting == name
         text = self.prompt_text(name)
         spans = self.prompt_spans(text, rect.w - 20)
         height = self.exposure_font.get_linesize() + 3
-        pygame.draw.rect(self.window, (21, 23, 26), rect, border_radius=4)
+        pygame.draw.rect(self.window, background, rect, border_radius=4)
         pygame.draw.rect(self.window, (213, 184, 99) if active else (71, 67, 59), rect, 1, border_radius=4)
         original_clip = self.window.get_clip()
         self.window.set_clip(rect.inflate(-12, -12).clip(original_clip))
@@ -815,13 +836,13 @@ class CheckMateGui:
                 left = self.exposure_font.size(text[start:max(start, selected_start)])[0]
                 right = self.exposure_font.size(text[start:min(end, selected_end)])[0]
                 pygame.draw.rect(self.window, (65, 93, 130), (x + left, y, max(2, right-left), height))
-            self.window.blit(self.exposure_font.render(text[start:end], True, (224, 225, 229)), (x, y))
+            self.window.blit(self.exposure_font.render(text[start:end], True, color), (x, y))
         if active:
             row = self.prompt_cursor_row(spans)
             x = rect.x + 10 + self.exposure_font.size(text[spans[row][0]:self.setting_editor.cursor])[0]
             y = rect.y + 10 + row * height
             if pygame.time.get_ticks() % 1000 < 650:
-                pygame.draw.line(self.window, (245, 245, 245), (x, y), (x, y + height - 3))
+                pygame.draw.line(self.window, color, (x, y), (x, y + height - 3))
         self.window.set_clip(original_clip)
 
     def draw_system_prompt_preview(self, rect, prompt=SYSTEM_PROMPT):
@@ -1061,8 +1082,14 @@ class CheckMateGui:
                     if self.drag_scrollbar == "thinking":
                         self.drag_scrollbar = None
                 if name == "notes":
+                    if self.editing_player_notes:
+                        self.active_setting = None
+                        self.setting_editor.dragging = False
+                        pygame.key.stop_text_input()
                     self.notes_side = "black"
                     self.notes_by_side = {}
+                    self.note_review_locks = {"black": False, "white": False}
+                    self.notes_editable = False
                     self.notes_summary = ""
                     self.notes_scroll_positions = {}
                     self.notes_page_initialized = False
@@ -1074,19 +1101,37 @@ class CheckMateGui:
                 self.chat_layout_cache = None
                 self.exposure_line_cache.pop(name, None)
 
-    def set_side_notes(self, notes, summary=""):
+    @property
+    def editing_player_notes(self):
+        return bool(self.active_setting and self.active_setting.startswith("player_notes:"))
+
+    def notes_editor_rect(self):
+        rect = self.exposure_pane_rects().get("notes")
+        if rect is None:
+            return None
+        body = self.exposure_body(rect)
+        height = self.exposure_font.get_linesize() + 3
+        count = len(self.prompt_spans(self.setting_editor.text, body.w))
+        return pygame.Rect(body.x-10, body.y-10-self.exposure_panes["notes"].scroll*height,
+                           body.w+20, count*height+20)
+
+    def set_side_notes(self, notes, summary="", locks=None, *, editable=False):
         """Refresh stored notes while preserving the selected side and reading position."""
         if not self.notes_page_initialized and any(notes.get(side) for side in ("black", "white")):
             self.notes_side = "black" if notes.get("black") else "white"
             self.notes_page_initialized = True
         self.notes_by_side = {side: notes.get(side, "") for side in ("black", "white")}
+        self.note_review_locks = {side: (locks or {}).get(side, False) for side in ("black", "white")}
+        self.notes_editable = editable
         self.notes_summary = summary
         self.refresh_notes_page()
 
     def refresh_notes_page(self):
         pane = self.exposure_panes["notes"]
         text = self.notes_by_side.get(self.notes_side, "")
-        if self.notes_summary:
+        if self.editing_player_notes:
+            text = self.setting_editor.text
+        elif self.notes_summary:
             text += ("\n\n" if text else "") + self.notes_summary
         if pane.text != text:
             pane.text = text
@@ -1107,12 +1152,14 @@ class CheckMateGui:
 
     def notes_page_controls(self):
         rect = self.exposure_pane_rects().get("notes")
-        if rect is None or rect.w < 116:
+        if rect is None or rect.w < 148:
             return {}
-        right = pygame.Rect(rect.right - 32, rect.y + 5, 22, 24)
-        field = pygame.Rect(right.x - 60, right.y, 56, right.h)
-        left = pygame.Rect(field.x - 26, right.y, 22, right.h)
-        return {"previous": left, "side": field, "next": right}
+        right = pygame.Rect(rect.right - 24, rect.y + 5, 20, 24)
+        field = pygame.Rect(right.x - 54, right.y, 52, right.h)
+        left = pygame.Rect(field.x - 22, right.y, 20, right.h)
+        lock = pygame.Rect(left.x - 22, right.y, 20, right.h)
+        edit = pygame.Rect(lock.x - 22, right.y, 20, right.h)
+        return {"edit": edit, "lock": lock, "previous": left, "side": field, "next": right}
 
     def handle_notes_page_event(self, event):
         if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
@@ -1127,6 +1174,25 @@ class CheckMateGui:
         return False
 
     def draw_notes_page_controls(self, controls):
+        for name in ("edit", "lock"):
+            rect = controls[name]
+            pygame.draw.rect(self.window, (58, 61, 65), rect, border_radius=3)
+            color = ((234, 222, 199) if self.notes_editable else (104, 105, 108))
+            x, y = rect.center
+            if name == "edit":
+                if self.editing_player_notes:
+                    pygame.draw.lines(self.window, color, False, [(x-6, y), (x-1, y+5), (x+6, y-5)], 2)
+                else:
+                    pygame.draw.line(self.window, color, (x-5, y+5), (x+5, y-5), 3)
+                    pygame.draw.line(self.window, color, (x-6, y+6), (x-3, y+6), 1)
+            else:
+                locked = self.note_review_locks[self.notes_side]
+                if locked and self.notes_editable:
+                    color = (230, 189, 99)
+                pygame.draw.rect(self.window, color, (x-6, y, 12, 8), 2, border_radius=2)
+                arc = pygame.Rect(x-4+(0 if locked else 4), y-7, 8, 12)
+                pygame.draw.arc(self.window, color, arc, 0, 3.14159, 2)
+                pygame.draw.line(self.window, color, (arc.left, y-1), (arc.left, y+1), 2)
         for name in ("previous", "next"):
             rect = controls[name]
             direction = -1 if name == "previous" else 1
@@ -1139,8 +1205,39 @@ class CheckMateGui:
         rect = controls["side"]
         pygame.draw.rect(self.window, (27, 29, 32), rect, border_radius=3)
         pygame.draw.rect(self.window, (110, 103, 88), rect, 1, border_radius=3)
-        label = self.tooltip_font.render(self.notes_side.capitalize(), True, (234, 222, 199))
+        label = self.tooltip_font.render(self.fit_text(self.notes_side.capitalize(), rect.w-4, self.tooltip_font), True, (234, 222, 199))
         self.window.blit(label, label.get_rect(center=rect.center))
+
+    def notes_control_tooltip(self, position):
+        if not self.notes_editable:
+            return ""
+        side = self.notes_side.capitalize()
+        for name, rect in self.notes_page_controls().items():
+            if rect.collidepoint(position):
+                if name == "lock":
+                    return (f"Now, requests that check hypotheses and update notes for {side} will "
+                            + ("be skipped." if self.note_review_locks[self.notes_side] else "not be skipped.")
+                            + (" Click to unlock." if self.note_review_locks[self.notes_side] else " Click to lock."))
+                if name == "edit":
+                    return (f"Save {side}'s notes. Ctrl+Enter saves; Esc cancels." if self.editing_player_notes
+                            else f"Edit {side}'s victory-condition notes.")
+        return ""
+
+    def draw_notes_control_tooltip(self):
+        position = pygame.mouse.get_pos()
+        text = self.notes_control_tooltip(position)
+        if not text:
+            return
+        lines = self.wrap_tooltip_text(text, min(310, self.window.get_width()-24), 8, self.tooltip_font)
+        labels = [self.tooltip_font.render(line, True, (234, 222, 199)) for line in lines]
+        width = max(label.get_width() for label in labels)+16
+        height = len(labels)*(self.tooltip_font.get_linesize()+2)+12
+        rect = pygame.Rect(position[0]-width-8, position[1]+14, width, height)
+        rect.clamp_ip(self.window.get_rect().inflate(-8, -8))
+        pygame.draw.rect(self.window, (32, 35, 39), rect, border_radius=4)
+        pygame.draw.rect(self.window, (130, 119, 91), rect, 1, border_radius=4)
+        for index, label in enumerate(labels):
+            self.window.blit(label, (rect.x+8, rect.y+6+index*(self.tooltip_font.get_linesize()+2)))
 
     def append_exposure_output(self, text, color=None, side=None, request_id=None, turn=None):
         """Keep this live game's received output; follow the tail only when at it."""
@@ -1448,9 +1545,10 @@ class CheckMateGui:
             pygame.draw.rect(self.window, (71, 67, 59), rect, 1, border_radius=4)
             self.window.set_clip(rect.clip(original_clip))
             navigation = self.thinking_turn_controls() if name == "thinking" else self.notes_page_controls()
-            title_width = navigation["previous"].left - rect.x - 16 if navigation else rect.w - 20
+            title_width = navigation["edit" if name == "notes" else "previous"].left - rect.x - 16 if navigation else rect.w - 20
             title = self.small_font.render(self.fit_text(pane.title, max(1, title_width), self.small_font), True, (225, 213, 191))
-            self.window.blit(title, (rect.x + 10, rect.y + 8))
+            if title_width > 16:
+                self.window.blit(title, (rect.x + 10, rect.y + 8))
             if navigation:
                 if name == "thinking":
                     self.draw_thinking_turn_controls(navigation)
@@ -1470,7 +1568,12 @@ class CheckMateGui:
                 self.window.set_clip(rect.clip(original_clip))
                 pygame.draw.rect(self.window, background, pygame.Rect(rect.x + 1, body.y - 2, rect.w - 2, rect.bottom - body.y + 1))
                 self.window.set_clip(body.clip(rect).clip(original_clip))
-            if has_messages:
+            if name == "notes" and self.editing_player_notes:
+                self.draw_prompt_editor(self.active_setting, self.notes_editor_rect(), background=background, color=color)
+                if self.settings_error.startswith(("Notes exceed", "Clipboard")):
+                    label = self.tooltip_font.render(self.fit_text(self.settings_error, body.w, self.tooltip_font), True, (235, 74, 72))
+                    self.window.blit(label, (body.x, body.bottom-self.tooltip_font.get_linesize()))
+            elif has_messages:
                 self.draw_chat_messages(body, pane)
             else:
                 for index, line in enumerate(lines[pane.scroll:pane.scroll + visible]):
@@ -1490,6 +1593,7 @@ class CheckMateGui:
                 height = min(track.h, max(12, round(track.h * visible / count)))
                 top = track.y + round((track.h - height) * pane.scroll / (count - visible))
                 pygame.draw.rect(self.window, (110, 103, 88), (track.x, top, track.w, height), border_radius=2)
+        self.draw_notes_control_tooltip()
 
     def load_images(self) -> dict[str, pygame.Surface]:
         def load(name: str) -> pygame.Surface:
@@ -2078,7 +2182,7 @@ class CheckMateGui:
             for index, line in enumerate(wrapped):
                 if len(lines) >= max_lines:
                     break
-                lines.append((prefix if index == 0 else "  ") + line)
+                lines.append((prefix if index == 0 else " " * len(prefix)) + line)
             if len(lines) >= max_lines:
                 break
         return lines or [""]
